@@ -4,7 +4,7 @@ from pathlib import Path
 from tqdm import tqdm
 import torch
 import imageio.v2 as imageio
-from diffusers import AutoPipelineForText2Video
+from diffusers import DiffusionPipeline
 
 def main():
     ap = argparse.ArgumentParser()
@@ -31,7 +31,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Loading WAN 2.1 ({model_name}) base checkpoint and LoRA...")
-    pipe = AutoPipelineForText2Video.from_pretrained(
+    pipe = DiffusionPipeline.from_pretrained(
         base_ckpt, torch_dtype=torch.float16
     ).to(device)
 

@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 import numpy as np
-from diffusers import AutoPipelineForText2Video
+from diffusers import DiffusionPipeline
 from peft import get_peft_model, LoraConfig
 from tqdm import tqdm
 
@@ -52,7 +52,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print("Loading WAN 2.1 1.3 G backbone...")
-    pipe = AutoPipelineForText2Video.from_pretrained(
+    pipe = DiffusionPipeline.from_pretrained(
         cfg["model"]["ckpt"],
         torch_dtype=torch.float16,
     ).to(device)
