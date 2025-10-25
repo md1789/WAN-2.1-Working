@@ -1,0 +1,40 @@
+# configs/lora_wan21_har.yaml
+model:
+  name: wan-2.1-1.3g
+  ckpt: checkpoints/wan-2.1-1.3g.safetensors  # place or auto-download
+  vram_precision: fp16
+
+lora:
+  r: 64
+  alpha: 64
+  dropout: 0.05
+  target_modules:
+    - to_q
+    - to_k
+    - to_v
+    - to_out.0
+
+data:
+  root: data/har
+  fps: 16
+  size: 512
+  clip_len: 32
+  train_split: train
+  val_split: val
+
+train:
+  seed: 1337
+  batch_size: 2
+  grad_accum: 8
+  max_steps: 8000
+  lr: 1.0e-4
+  wd: 0.01
+  ema: 0.999
+  save_every: 1000
+  log_every: 50
+  out_dir: outputs/lora_har
+
+compute:
+  bf16: true
+  gradient_checkpointing: true
+  compile: false
