@@ -1,8 +1,10 @@
 # configs/lora_wan21_har.yaml
 model:
-  name: wan-2.1-1.3g
-  ckpt: checkpoints/wan-2.1-1.3g.safetensors  # place or auto-download
+  model:
+  name: wan-t2v-v1.3
+  base_ckpt: "TencentARC/WanT2V"
   vram_precision: fp16
+  lora_path: "outputs/lora_har/lora_ema_last.safetensors"
 
 lora:
   r: 64
