@@ -31,9 +31,16 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Loading WAN 2.1 ({model_name}) base checkpoint and LoRA...")
+
+    base_ckpt = cfg["model"].get("base_ckpt", None)
+    if not base_ckpt:
+        raise ValueError("❌ Missing 'base_ckpt' in config['model'] — check your YAML!")
+
     pipe = DiffusionPipeline.from_pretrained(
-        base_ckpt, torch_dtype=torch.float16
+        base_ckpt,
+        torch_dtype=torch.float16,
     ).to(device)
+
 
     # Load LoRA adapters
     if os.path.exists(lora_path):
