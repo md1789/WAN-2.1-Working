@@ -1,6 +1,6 @@
 model:
   name: wan-2.1-1.3g
-  base_ckpt: "TencentARC/WanT2V"
+  base_ckpt: "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
   vram_precision: fp16
   lora_path: "outputs/lora_har/lora_ema_last.safetensors"
 
