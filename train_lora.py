@@ -51,7 +51,7 @@ def main():
     cfg = load_cfg(args.config)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    print("Loading WAN 2.1 1.3 G backbone...")
+    print(f"DEBUG: Attempting to load base_ckpt = {cfg['model'].get('base_ckpt')}")
     pipe = DiffusionPipeline.from_pretrained(
         cfg["model"]["base_ckpt"],
         torch_dtype=torch.float16,

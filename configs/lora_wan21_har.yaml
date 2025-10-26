@@ -1,7 +1,5 @@
-# configs/lora_wan21_har.yaml
 model:
-  model:
-  name: wan-t2v-v1.3
+  name: wan-2.1-1.3g
   base_ckpt: "TencentARC/WanT2V"
   vram_precision: fp16
   lora_path: "outputs/lora_har/lora_ema_last.safetensors"
@@ -40,3 +38,15 @@ compute:
   bf16: true
   gradient_checkpointing: true
   compile: false
+
+sampler:
+  frames: 16
+  fps: 8
+  size: 512
+  steps: 25
+  cfg_scale: 7.5
+
+dataset:
+  classes: ["running", "walking", "jumping"]
+  per_class: 10
+  out_dir: "outputs/generated_videos"

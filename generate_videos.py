@@ -33,8 +33,9 @@ def main():
     print(f"Loading WAN 2.1 ({model_name}) base checkpoint and LoRA...")
 
     base_ckpt = cfg["model"].get("base_ckpt", None)
+    print(f"DEBUG: Attempting to load base_ckpt = {cfg['model'].get('base_ckpt')}")
     if not base_ckpt:
-        raise ValueError("❌ Missing 'base_ckpt' in config['model'] — check your YAML!")
+        raise ValueError("Missing 'base_ckpt' in config['model'] — check your YAML!")
 
     pipe = DiffusionPipeline.from_pretrained(
         base_ckpt,
