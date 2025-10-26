@@ -53,9 +53,12 @@ def main():
 
     print("Loading WAN 2.1 1.3 G backbone...")
     pipe = DiffusionPipeline.from_pretrained(
-        cfg["model"]["ckpt"],
+        cfg["model"]["base_ckpt"],
         torch_dtype=torch.float16,
     ).to(device)
+
+    if not cfg["model"]["base_ckpt"]:
+        raise ValueError("Missing base_ckpt in YAML config — check your model section.")
 
     # Freeze base model
     for p in pipe.unet.parameters():
