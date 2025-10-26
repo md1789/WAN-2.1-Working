@@ -15,12 +15,11 @@ lora:
     - to_out.0
 
 data:
-  root: data/har
+  root: samples/har
   fps: 16
   size: 512
   clip_len: 32
-  train_split: train
-  val_split: val
+
 
 train:
   seed: 1337
