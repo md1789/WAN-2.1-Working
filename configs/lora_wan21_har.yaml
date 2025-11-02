@@ -1,51 +1,28 @@
 model:
-  name: wan-2.1-1.3g
+  name: wan-2.1-1.3b
   base_ckpt: "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
-  vram_precision: fp16
-  lora_path: "outputs/lora_har/lora_ema_last.safetensors"
 
 lora:
   r: 64
   alpha: 64
   dropout: 0.05
-  target_modules:
-    - to_q
-    - to_k
-    - to_v
-    - to_out.0
 
 data:
-  root: samples/har
-  fps: 16
-  size: 512
-  clip_len: 32
-
+  root: "data/har"   # if empty folder, we'll synthesize samples so it still runs
+  size: 256
+  clip_len: 16
 
 train:
   seed: 1337
   batch_size: 2
   grad_accum: 8
-  max_steps: 8000
+  max_steps: 200      # keep small for smoke test
   lr: 1.0e-4
   wd: 0.01
-  ema: 0.999
-  save_every: 1000
-  log_every: 50
-  out_dir: outputs/lora_har
+  log_every: 10
+  out_dir: "outputs/lora_har"
 
 compute:
   bf16: true
   gradient_checkpointing: true
   compile: false
-
-sampler:
-  frames: 16
-  fps: 8
-  size: 512
-  steps: 25
-  cfg_scale: 7.5
-
-dataset:
-  classes: ["running", "walking", "jumping"]
-  per_class: 10
-  out_dir: "outputs/generated_videos"

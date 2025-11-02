@@ -1,30 +1,17 @@
-# configs/infer_har.yaml
 model:
-  name: wan-2.1-1.3g
-  base_ckpt: checkpoints/wan-2.1-1.3g.safetensors
-  lora_path: outputs/lora_har/checkpoints/ema_last.safetensors
-  vram_precision: fp16
+  name: wan-2.1-1.3b
+  base_ckpt: "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+  lora_path: "outputs/lora_har/lora_ema_last"   # folder saved by train script; optional
 
 sampler:
-  steps: 50
-  cfg_scale: 3.0
-  fps: 20
-  frames: 48
-  size: 512
-  schedule: dpmpp_2m
+  frames: 16
+  fps: 8
+  size: 448
+  steps: 20
+  cfg_scale: 6.0
+  seed: 42
 
 dataset:
-  classes:
-    - walking
-    - running
-    - jumping
-    - clapping
-    - waving
-    - situp
-    - pushup
-    - squat
-    - pullup
-    - cycling
-  per_class: 10
-  seed: 1337
-  out_dir: samples/har
+  classes: ["walking", "running", "jumping", "waving"]
+  per_class: 1
+  out_dir: "outputs/samples"
