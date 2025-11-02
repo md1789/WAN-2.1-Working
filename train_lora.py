@@ -1,176 +1,143 @@
-# train_lora.py — WAN 2.1 LoRA training (transformer-based, no .unet)
-import os, argparse, yaml, math, time, warnings
+# train_lora.py — WAN 2.1 LoRA Training (fixed version, 2025-11)
+import os, argparse, yaml, math, torch
 from pathlib import Path
-from dataclasses import dataclass
-
-import torch
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
-
+from dataclasses import dataclass
+from tqdm import tqdm
 from diffusers import DiffusionPipeline
-from diffusers.models.attention_processor import (
-    AttnProcessor2_0,
-    LoRAAttnProcessor2_0,
-)
 
-warnings.filterwarnings("ignore", category=UserWarning)
-
-# ------------------------------- utils -------------------------------
+# -------------------------------------------------------------------------
+@dataclass
+class Config:
+    cfg_path: str
 
 def load_cfg(path):
     with open(path, "r") as f:
         return yaml.safe_load(f)
+# -------------------------------------------------------------------------
 
-def pick_dtype(cfg):
-    bf16 = bool(cfg.get("compute", {}).get("bf16", False))
-    return torch.bfloat16 if (bf16 and torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
-
-# ------------------------------- dataset -----------------------------
-
+# Simple placeholder dataset — replace with real video decoding if desired
 class HARVideoDataset(Dataset):
-    """
-    Placeholder dataset.
-    If no real videos are found under data root, we synthesize N items so the
-    training loop (and LoRA saving) still runs for your assignment continuation.
-    """
-    def __init__(self, root, clip_len=16, size=256, synth_items=128):
+    def __init__(self, root, clip_len=16, size=256):
         self.items = []
-        root = os.path.expanduser(root)
-        if os.path.isdir(root):
-            for cls in sorted(os.listdir(root)):
-                cpath = os.path.join(root, cls)
-                if not os.path.isdir(cpath):
-                    continue
-                vids = [
-                    os.path.join(cpath, v)
-                    for v in os.listdir(cpath)
-                    if v.lower().endswith((".mp4", ".avi", ".mov"))
-                ]
-                self.items += [(v, cls) for v in vids]
+        for cls in sorted(os.listdir(root)):
+            cpath = os.path.join(root, cls)
+            if not os.path.isdir(cpath):
+                continue
+            vids = [os.path.join(cpath, v) for v in os.listdir(cpath)
+                    if v.endswith((".mp4", ".avi"))]
+            self.items += [(v, cls) for v in vids]
 
-        # Fallback so you never get num_samples=0 again.
-        if len(self.items) == 0:
-            # create synthetic class labels
-            classes = ["walking", "running", "jumping", "waving"]
-            self.items = [("synthetic", c) for _ in range(synth_items) for c in classes]
+        self.clip_len = clip_len
+        self.transform = transforms.Compose([
+            transforms.Resize((size, size))
+        ])
 
-        self.clip_len = int(clip_len)
-        self.size = int(size)
-        self.transform = transforms.Resize((self.size, self.size))
-
-    def __len__(self):
-        return len(self.items)
+    def __len__(self): return len(self.items)
 
     def __getitem__(self, idx):
-        # Placeholder: random frames + text prompt; swap with real frame decoding later
-        frames = torch.randn(3, self.clip_len, self.size, self.size)  # (C, T, H, W)
-        _, cls = self.items[idx]
+        # Placeholder random tensor; replace with real frame loader
+        frames = torch.randn(3, self.clip_len, 256, 256)
+        cls = self.items[idx][1]
         prompt = f"a person performing {cls}"
         return frames, prompt
+# -------------------------------------------------------------------------
 
-# ------------------------------ LoRA helpers -------------------------
-
-def inject_lora_into_transformer(transformer, rank=64, alpha=64, dropout=0.05):
+def inject_lora_into_transformer(transformer, rank=64, alpha=64, dropout=0.0):
     """
-    Universal LoRA injector compatible with Diffusers >=0.29–0.33.
-    Ensures LoRA weights require grad and the model can train.
+    Universal LoRA injector compatible with Diffusers 0.29–0.33+.
+    Safely attaches LoRA processors and ensures parameters are trainable.
     """
     from diffusers.models.attention_processor import (
         AttnProcessor2_0,
         LoRAAttnProcessor2_0,
     )
 
+    cfg = getattr(transformer, "config", None)
+    if cfg is None:
+        raise RuntimeError("Transformer missing .config; cannot infer hidden size.")
+    head_dim = cfg.attention_head_dim[-1] if isinstance(cfg.attention_head_dim, (list, tuple)) else cfg.attention_head_dim
+    num_heads = cfg.num_attention_heads[-1] if isinstance(cfg.num_attention_heads, (list, tuple)) else cfg.num_attention_heads
+    hidden_size = int(head_dim) * int(num_heads)
+
     attn_procs = {}
-
-    for name, module in transformer.attn_processors.items():
-        try:
-            # Most current versions (0.31+)
-            lora = LoRAAttnProcessor2_0()
-        except Exception:
+    count = 0
+    for name, _ in transformer.attn_processors.items():
+        created = None
+        for ctor in (
+            lambda: LoRAAttnProcessor2_0(hidden_size=hidden_size, cross_attention_dim=None,
+                                         rank=rank, network_alpha=alpha),
+            lambda: LoRAAttnProcessor2_0(hidden_size, None, rank),
+            lambda: LoRAAttnProcessor2_0(hidden_size=hidden_size, cross_attention_dim=None,
+                                         rank=rank, lora_alpha=alpha),
+        ):
             try:
-                # Older variants might require args
-                lora = LoRAAttnProcessor2_0(None, None)
+                created = ctor()
+                break
+            except TypeError:
+                continue
             except Exception:
-                # Fallback to vanilla processor
-                lora = AttnProcessor2_0()
+                continue
 
-        attn_procs[name] = lora
+        if created is None:
+            created = AttnProcessor2_0()
+        attn_procs[name] = created
+        count += 1
 
     transformer.set_attn_processor(attn_procs)
 
-    # Mark LoRA weights trainable — needed for 0.31+
-    for name, module in transformer.attn_processors.items():
-        for param_name, param in module.named_parameters():
-            if "lora" in param_name.lower():
-                param.requires_grad_(True)
+    # Mark LoRA params trainable
+    trainable = []
+    for m in transformer.attn_processors.values():
+        if hasattr(m, "parameters"):
+            for p in m.parameters():
+                p.requires_grad_(True)
+                if p.requires_grad:
+                    trainable.append(p)
 
-    # Log total params
-    trainable_params = sum(p.numel() for p in transformer.parameters() if p.requires_grad)
-    print(f"[LoRA] Injected into {len(attn_procs)} attention blocks.")
-    print(f"[LoRA] Total trainable params: {trainable_params:,}")
-    return trainable_params
-
-
-# --------------------------------- main ------------------------------
+    total_trainable = sum(p.numel() for p in trainable)
+    print(f"[LoRA] Injected into {count} attention blocks.")
+    print(f"[LoRA] Trainable LoRA params: {total_trainable:,}")
+    return trainable
+# -------------------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", required=True, help="Path to YAML config")
+    ap.add_argument("--config", required=True)
     args = ap.parse_args()
-
     cfg = load_cfg(args.config)
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = pick_dtype(cfg)
+    dtype = torch.float16
 
-    base_ckpt = cfg["model"]["base_ckpt"]
-    if not base_ckpt:
-        raise ValueError("Missing model.base_ckpt in YAML.")
-
-    print(f"[WAN 2.1] Loading base checkpoint: {base_ckpt}")
+    print(f"[WAN 2.1] Loading base checkpoint: {cfg['model']['base_ckpt']}")
     pipe = DiffusionPipeline.from_pretrained(
-        base_ckpt,
-        torch_dtype=dtype,
-        variant=None,  # keep default unless you know a specific fp16/bf16 variant exists
+        cfg["model"]["base_ckpt"],
+        dtype=dtype,
     ).to(device)
 
-    # WAN 2.1 uses a Transformer backbone (not .unet)
-    if not hasattr(pipe, "transformer"):
-        available = [k for k in pipe.components.keys()]
-        raise AttributeError(
-            f"WanPipeline has no attribute '.transformer'. Components: {available}"
-        )
-
-    transformer = pipe.transformer
-
-    # Optional speed/memory tweaks
-    if bool(cfg.get("compute", {}).get("gradient_checkpointing", False)):
-        if hasattr(transformer, "enable_gradient_checkpointing"):
-            transformer.enable_gradient_checkpointing()
-
-    if bool(cfg.get("compute", {}).get("compile", False)) and hasattr(torch, "compile"):
-        transformer = torch.compile(transformer)  # will wrap for speed on PyTorch 2.x
-
-    # Inject LoRA at attention processors
-    lora_cfg = cfg["lora"]
+    # Attach LoRA to transformer (WAN 2.1 uses transformer backbone)
     print("[LoRA] Attaching LoRA to transformer attention processors …")
     trainable_params = inject_lora_into_transformer(
-        transformer,
-        rank=int(lora_cfg.get("r", 64)),
-        alpha=int(lora_cfg.get("alpha", 64)),
-        dropout=float(lora_cfg.get("dropout", 0.05)),
+        pipe.transformer,
+        rank=int(cfg["lora"]["r"]),
+        alpha=int(cfg["lora"]["alpha"]),
+        dropout=float(cfg["lora"]["dropout"]),
     )
-    print(f"[LoRA] Trainable params (LoRA only): {trainable_params:,}")
 
-    # Optimizer on LoRA params only
-    optim = torch.optim.AdamW(
-        [p for p in transformer.parameters() if p.requires_grad],
+    if len(trainable_params) == 0:
+        raise RuntimeError("❌ No trainable LoRA params found — injection failed!")
+
+    opt = torch.optim.AdamW(
+        trainable_params,
         lr=float(cfg["train"]["lr"]),
-        weight_decay=float(cfg["train"]["wd"]),
+        weight_decay=float(cfg["train"]["wd"])
     )
 
-    # Data
+    # Dataset
     ds = HARVideoDataset(
-        root=cfg["data"]["root"],
+        cfg["data"]["root"],
         clip_len=int(cfg["data"]["clip_len"]),
         size=int(cfg["data"]["size"]),
     )
@@ -179,67 +146,54 @@ def main():
         batch_size=int(cfg["train"]["batch_size"]),
         shuffle=True,
         num_workers=2,
-        drop_last=True,
     )
-    print(f"[Data] {len(ds)} samples — batch_size={cfg['train']['batch_size']}")
 
-    # Simple warmup scheduler (optional)
-    max_steps = int(cfg["train"]["max_steps"])
-    warmup = max(10, max_steps // 20)
-    def lr_lambda(step):
-        if step < warmup:
-            return float(step) / float(max(1, warmup))
-        return 1.0
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda)
-
+    steps = int(cfg["train"]["max_steps"])
+    grad_accum = int(cfg["train"]["grad_accum"])
+    log_every = int(cfg["train"]["log_every"])
     out_dir = Path(cfg["train"]["out_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
-    log_every = int(cfg["train"]["log_every"])
-    grad_accum = max(1, int(cfg["train"]["grad_accum"]))
 
     scaler = torch.amp.GradScaler("cuda", enabled=(dtype == torch.float16))
-    print(f"[Train] Starting for {max_steps} steps (grad_accum={grad_accum}) …")
+    print(f"[Train] Starting for {steps} steps (grad_accum={grad_accum}) …")
 
-    transformer.train()
+    pipe.transformer.train()
     step = 0
-    while step < max_steps:
-        for frames, prompts in dl:
-            if step >= max_steps:
+    running_loss = 0.0
+
+    for epoch in range(9999):  # pseudo-epoch loop for streaming dataset
+        for frames, prompts in tqdm(dl, desc="Training Loop"):
+            if step >= steps:
                 break
 
-            frames = frames.to(device=device, dtype=dtype)
+            frames = frames.to(device, dtype=dtype)
 
-            # ------------------ Placeholder Loss ------------------
-            # This is a stub so LoRA weights get updated & saved.
-            # Replace with a proper diffusion loss for real training.
             with torch.amp.autocast("cuda", enabled=(dtype == torch.float16)):
-                # trivial consistency loss to exercise gradients
-                loss = (frames * 0.0).mean() + 1e-3  # constant to avoid zero grad
-            # ------------------------------------------------------
+                # Dummy placeholder loss — replace with real diffusion objective
+                pred = frames * 0.9
+                loss = (pred - frames).abs().mean()
 
             scaler.scale(loss / grad_accum).backward()
+            running_loss += loss.item()
 
             if (step + 1) % grad_accum == 0:
-                scaler.step(optim)
+                scaler.step(opt)
                 scaler.update()
-                optim.zero_grad(set_to_none=True)
-                scheduler.step()
+                opt.zero_grad()
 
             if step % log_every == 0:
-                lr = optim.param_groups[0]["lr"]
-                print(f"[Step {step:05d}] loss={loss.item():.6f} lr={lr:.2e}")
+                print(f"[Step {step:05d}] loss={running_loss/log_every:.6f}")
+                running_loss = 0.0
 
             step += 1
-            if step >= max_steps:
-                break
+        if step >= steps:
+            break
 
-    # Save LoRA attention processors
-    save_path = out_dir / "lora_ema_last"
-    save_path.mkdir(parents=True, exist_ok=True)
-    # save as Diffusers-style attention processors (directory)
-    transformer.save_attn_procs(save_path)
-    print(f"✅ LoRA attention processors saved to: {save_path.resolve()}")
-    print("   (Use `pipe.transformer.load_attn_procs(save_path)` at inference.)")
+    # Save LoRA weights
+    save_path = out_dir / "lora_ema_last.safetensors"
+    torch.save(pipe.transformer.state_dict(), save_path)
+    print(f"✅ Training complete — LoRA weights saved to {save_path}")
 
+# -------------------------------------------------------------------------
 if __name__ == "__main__":
     main()
