@@ -46,60 +46,41 @@ class HARVideoDataset(Dataset):
 
 def inject_lora_into_transformer(transformer, rank=64, alpha=64, dropout=0.0):
     """
-    Universal LoRA injector compatible with Diffusers 0.29–0.33+.
-    Safely attaches LoRA processors and ensures parameters are trainable.
+    Deep-inject LoRA into WAN 2.1 transformer blocks.
+    Works even if attention processors are stateless callables.
     """
-    from diffusers.models.attention_processor import (
-        AttnProcessor2_0,
-        LoRAAttnProcessor2_0,
-    )
+    from diffusers.models.attention_processor import LoRAAttnProcessor2_0
+    import torch.nn as nn
 
-    cfg = getattr(transformer, "config", None)
-    if cfg is None:
-        raise RuntimeError("Transformer missing .config; cannot infer hidden size.")
-    head_dim = cfg.attention_head_dim[-1] if isinstance(cfg.attention_head_dim, (list, tuple)) else cfg.attention_head_dim
-    num_heads = cfg.num_attention_heads[-1] if isinstance(cfg.num_attention_heads, (list, tuple)) else cfg.num_attention_heads
-    hidden_size = int(head_dim) * int(num_heads)
+    lora_modules = []
+    injected_blocks = 0
 
-    attn_procs = {}
-    count = 0
-    for name, _ in transformer.attn_processors.items():
-        created = None
-        for ctor in (
-            lambda: LoRAAttnProcessor2_0(hidden_size=hidden_size, cross_attention_dim=None,
-                                         rank=rank, network_alpha=alpha),
-            lambda: LoRAAttnProcessor2_0(hidden_size, None, rank),
-            lambda: LoRAAttnProcessor2_0(hidden_size=hidden_size, cross_attention_dim=None,
-                                         rank=rank, lora_alpha=alpha),
-        ):
+    for name, module in transformer.named_modules():
+        if hasattr(module, "to_q") and hasattr(module, "to_k") and hasattr(module, "to_v"):
+            # these are actual attention layers
             try:
-                created = ctor()
-                break
-            except TypeError:
-                continue
-            except Exception:
-                continue
+                hidden_size = module.to_q.in_features
+                lora_proc = LoRAAttnProcessor2_0(
+                    hidden_size=hidden_size,
+                    cross_attention_dim=None,
+                    rank=rank,
+                    network_alpha=alpha,
+                )
+                module.set_processor(lora_proc)
+                injected_blocks += 1
 
-        if created is None:
-            created = AttnProcessor2_0()
-        attn_procs[name] = created
-        count += 1
+                # collect trainable LoRA params
+                for p in lora_proc.parameters():
+                    p.requires_grad_(True)
+                    lora_modules.append(p)
+            except Exception as e:
+                print(f"[WARN] Skipped {name}: {e}")
 
-    transformer.set_attn_processor(attn_procs)
+    total_trainable = sum(p.numel() for p in lora_modules)
+    print(f"[LoRA] Deep-injected into {injected_blocks} attention layers.")
+    print(f"[LoRA] Trainable params: {total_trainable:,}")
+    return lora_modules
 
-    # Mark LoRA params trainable
-    trainable = []
-    for m in transformer.attn_processors.values():
-        if hasattr(m, "parameters"):
-            for p in m.parameters():
-                p.requires_grad_(True)
-                if p.requires_grad:
-                    trainable.append(p)
-
-    total_trainable = sum(p.numel() for p in trainable)
-    print(f"[LoRA] Injected into {count} attention blocks.")
-    print(f"[LoRA] Trainable LoRA params: {total_trainable:,}")
-    return trainable
 # -------------------------------------------------------------------------
 
 def main():
