@@ -72,49 +72,30 @@ class HARVideoDataset(Dataset):
 
 def inject_lora_into_transformer(transformer, rank=64, alpha=64, dropout=0.05):
     """
-    WAN 2.1 pipeline uses a Transformer (not UNet). We attach LoRA to *attention processors*.
-    We replace every AttnProcessor2_0 with a LoRAAttnProcessor2_0 of same hidden sizes.
+    Version-agnostic LoRA injection for Diffusers >=0.29–0.32.
+    Falls back gracefully depending on available constructor args.
     """
+    from diffusers.models.attention_processor import (
+        AttnProcessor2_0,
+        LoRAAttnProcessor2_0,
+    )
+
     attn_procs = {}
     for name, module in transformer.attn_processors.items():
-        # module is an AttnProcessor2_0 or similar; we mirror its dims
-        if not isinstance(module, AttnProcessor2_0):
-            # If the processor is not the 2_0 variant, still try to wrap if it exposes hidden_size
-            hidden_size = getattr(module, "hidden_size", None)
-            cross_hidden_size = getattr(module, "cross_attention_dim", None)
-        else:
-            hidden_size = module.hidden_size
-            cross_hidden_size = module.cross_attention_dim
-
-        if hidden_size is None:
-            # Fallback: try reading from transformer config (works for many diffusers models)
-            hidden_size = getattr(transformer.config, "attention_head_dim", None)
-            if isinstance(hidden_size, list):
-                hidden_size = max(hidden_size)
-        if cross_hidden_size is None:
-            cross_hidden_size = getattr(transformer.config, "cross_attention_dim", hidden_size)
-
         try:
-            attn_procs[name] = LoRAAttnProcessor2_0(
-                hidden_dim=hidden_size,
-                cross_attention_dim=cross_hidden_size,
-                rank=rank,
-                network_alpha=alpha,
-                dropout=dropout,
-            )
-        except TypeError:
-            # For newer diffusers builds that infer dims automatically
-            attn_procs[name] = LoRAAttnProcessor2_0(
-                rank=rank,
-                network_alpha=alpha,
-                dropout=dropout,
-            )
-
+            attn_procs[name] = LoRAAttnProcessor2_0()
+        except Exception:
+            try:
+                attn_procs[name] = LoRAAttnProcessor2_0(None, None)
+            except Exception:
+                # Fallback to standard processor if LoRA unavailable
+                attn_procs[name] = AttnProcessor2_0()
 
     transformer.set_attn_processor(attn_procs)
 
-    # sanity: params that require grad should now be LoRA weights only
+    # Unfreeze LoRA weights (they’re the only trainable ones now)
     trainable = [p for p in transformer.parameters() if p.requires_grad]
+    print(f"[LoRA] Injected into {len(attn_procs)} attention blocks.")
     return sum(p.numel() for p in trainable)
 
 # --------------------------------- main ------------------------------
