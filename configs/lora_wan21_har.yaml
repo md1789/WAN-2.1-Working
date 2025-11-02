@@ -8,7 +8,7 @@ lora:
   dropout: 0.05
 
 data:
-  root: "data/har"   # if empty folder, we'll synthesize samples so it still runs
+  root: "/content/data/har "   # if empty folder, we'll synthesize samples so it still runs
   size: 256
   clip_len: 16
 
