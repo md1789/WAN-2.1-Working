@@ -9,11 +9,24 @@ from torchvision import transforms
 from tqdm import tqdm
 
 from diffusers import DiffusionPipeline
-from diffusers.models.attention_processor import (
-    AttnProcessor2_0,
-    LoRAAttnProcessor2_0,
-    AttnProcsLayers,
-)
+from diffusers.models.attention_processor import AttnProcessor2_0, LoRAAttnProcessor2_0
+import torch.nn as nn
+
+# --- Compatibility shim for older Diffusers ---
+try:
+    from diffusers.models.attention_processor import AttnProcsLayers
+except ImportError:
+    class AttnProcsLayers(nn.Module):
+        """Fallback for older diffusers: simple container exposing processor params."""
+        def __init__(self, processors):
+            super().__init__()
+            self.processors = nn.ModuleDict({
+                k: v for k, v in processors.items() if isinstance(v, nn.Module)
+            })
+        def forward(self, *args, **kwargs):
+            raise NotImplementedError("AttnProcsLayers wrapper — no forward pass needed.")
+        def named_parameters(self, *a, **kw):
+            return self.processors.named_parameters(*a, **kw)
 
 # --------------------------- Config ---------------------------
 
