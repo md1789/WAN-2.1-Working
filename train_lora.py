@@ -94,13 +94,22 @@ def inject_lora_into_transformer(transformer, rank=64, alpha=64, dropout=0.05):
         if cross_hidden_size is None:
             cross_hidden_size = getattr(transformer.config, "cross_attention_dim", hidden_size)
 
-        attn_procs[name] = LoRAAttnProcessor2_0(
-            hidden_size=hidden_size,
-            cross_attention_dim=cross_hidden_size,
-            rank=rank,
-            network_alpha=alpha,
-            dropout=dropout,
-        )
+        try:
+            attn_procs[name] = LoRAAttnProcessor2_0(
+                hidden_dim=hidden_size,
+                cross_attention_dim=cross_hidden_size,
+                rank=rank,
+                network_alpha=alpha,
+                dropout=dropout,
+            )
+        except TypeError:
+            # For newer diffusers builds that infer dims automatically
+            attn_procs[name] = LoRAAttnProcessor2_0(
+                rank=rank,
+                network_alpha=alpha,
+                dropout=dropout,
+            )
+
 
     transformer.set_attn_processor(attn_procs)
 
