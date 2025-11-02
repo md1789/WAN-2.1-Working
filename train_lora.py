@@ -72,8 +72,8 @@ class HARVideoDataset(Dataset):
 
 def inject_lora_into_transformer(transformer, rank=64, alpha=64, dropout=0.05):
     """
-    Version-agnostic LoRA injection for Diffusers >=0.29–0.32.
-    Falls back gracefully depending on available constructor args.
+    Universal LoRA injector compatible with Diffusers >=0.29–0.33.
+    Ensures LoRA weights require grad and the model can train.
     """
     from diffusers.models.attention_processor import (
         AttnProcessor2_0,
@@ -81,22 +81,35 @@ def inject_lora_into_transformer(transformer, rank=64, alpha=64, dropout=0.05):
     )
 
     attn_procs = {}
+
     for name, module in transformer.attn_processors.items():
         try:
-            attn_procs[name] = LoRAAttnProcessor2_0()
+            # Most current versions (0.31+)
+            lora = LoRAAttnProcessor2_0()
         except Exception:
             try:
-                attn_procs[name] = LoRAAttnProcessor2_0(None, None)
+                # Older variants might require args
+                lora = LoRAAttnProcessor2_0(None, None)
             except Exception:
-                # Fallback to standard processor if LoRA unavailable
-                attn_procs[name] = AttnProcessor2_0()
+                # Fallback to vanilla processor
+                lora = AttnProcessor2_0()
+
+        attn_procs[name] = lora
 
     transformer.set_attn_processor(attn_procs)
 
-    # Unfreeze LoRA weights (they’re the only trainable ones now)
-    trainable = [p for p in transformer.parameters() if p.requires_grad]
+    # Mark LoRA weights trainable — needed for 0.31+
+    for name, module in transformer.attn_processors.items():
+        for param_name, param in module.named_parameters():
+            if "lora" in param_name.lower():
+                param.requires_grad_(True)
+
+    # Log total params
+    trainable_params = sum(p.numel() for p in transformer.parameters() if p.requires_grad)
     print(f"[LoRA] Injected into {len(attn_procs)} attention blocks.")
-    return sum(p.numel() for p in trainable)
+    print(f"[LoRA] Total trainable params: {trainable_params:,}")
+    return trainable_params
+
 
 # --------------------------------- main ------------------------------
 
@@ -184,7 +197,7 @@ def main():
     log_every = int(cfg["train"]["log_every"])
     grad_accum = max(1, int(cfg["train"]["grad_accum"]))
 
-    scaler = torch.cuda.amp.GradScaler(enabled=(dtype == torch.float16))
+    scaler = torch.amp.GradScaler("cuda", enabled=(dtype == torch.float16))
     print(f"[Train] Starting for {max_steps} steps (grad_accum={grad_accum}) …")
 
     transformer.train()
@@ -199,7 +212,7 @@ def main():
             # ------------------ Placeholder Loss ------------------
             # This is a stub so LoRA weights get updated & saved.
             # Replace with a proper diffusion loss for real training.
-            with torch.cuda.amp.autocast(enabled=(dtype == torch.float16)):
+            with torch.amp.autocast("cuda", enabled=(dtype == torch.float16)):
                 # trivial consistency loss to exercise gradients
                 loss = (frames * 0.0).mean() + 1e-3  # constant to avoid zero grad
             # ------------------------------------------------------
