@@ -1,4 +1,4 @@
-# generate_videos.py — WAN 2.1 T2V generation + optional LoRA
+# generate_videos.py — WAN 2.1 T2V generation + optional LoRA (Colab-safe linalg)
 import os, argparse, yaml, warnings
 from pathlib import Path
 
@@ -14,12 +14,6 @@ import torch
 import imageio.v2 as imageio
 from tqdm import tqdm
 from diffusers import DiffusionPipeline
-from diffusers.schedulers import (
-    EulerDiscreteScheduler,
-    DPMSolverMultistepScheduler,
-    DDIMScheduler,
-    UniPCMultistepScheduler,
-)
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -50,7 +44,6 @@ def to_hwc_uint8(frame) -> "np.ndarray":
     if isinstance(frame, torch.Tensor):
         fr = frame.detach().clamp(0, 255).to(torch.uint8).cpu().numpy()
     else:
-        # assume numpy
         import numpy as np
         fr = frame
         if fr.dtype != np.uint8:
@@ -58,44 +51,56 @@ def to_hwc_uint8(frame) -> "np.ndarray":
     return fr
 
 
-def try_set_scheduler(pipe, requested: str):
-    """
-    Keep WAN's default (flow-matching) scheduler unless user explicitly asks
-    AND the requested scheduler is compatible with the pipeline's prediction_type.
-    """
-    requested = (requested or "default").lower()
-    current_pred = getattr(pipe.scheduler.config, "prediction_type", None)
-    if requested in ["default", "auto", "keep", ""]:
-        print(f"[Scheduler] Keeping pipeline default: {pipe.scheduler.__class__.__name__} "
-              f"(prediction_type={current_pred})")
-        return
+def maybe_warn_lora_dir(lora_path: str):
+    if not lora_path:
+        return False
+    if os.path.isdir(lora_path):
+        return True
+    print("[LoRA] WARNING: "
+          f"'{lora_path}' is not a directory. Expected a folder saved via save_attn_procs(). "
+          "Continuing base-only.")
+    return False
 
-    # If the pipeline uses flow-matching, many classic schedulers won't work.
-    if current_pred not in (None, "epsilon", "v_prediction"):
-        print(f"[Scheduler] Pipeline uses prediction_type='{current_pred}'. "
-              f"Requested '{requested}' may be incompatible. Keeping default.")
-        print(f"[Scheduler] Using: {pipe.scheduler.__class__.__name__}")
-        return
 
-    try:
-        if requested in ["euler", "euler_discrete"]:
-            pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
-        elif requested in ["dpmpp_2m", "dpmpp", "dpm++", "dpmsolver++"]:
-            pipe.scheduler = DPMSolverMultistepScheduler.from_config(
-                pipe.scheduler.config, algorithm_type="dpmsolver++"
+def run_one(pipe, prompt, neg, frames, size, steps, cfg_scale, generator, device, dtype):
+    # Prefer MAGMA linalg on quirky Colab images to avoid cuSOLVER crashes
+    # You can also force this via YAML: compute.linalg: magma
+    pref = (torch.backends.cuda.preferred_linalg_library if torch.cuda.is_available()
+            else None)
+    linalg_pref = "magma"
+
+    ctx_autocast = (
+        torch.autocast(device_type="cuda", dtype=dtype)
+        if device == "cuda"
+        else torch.cpu.amp.autocast(dtype=torch.float32, enabled=False)
+    )
+
+    def _call():
+        with torch.no_grad(), ctx_autocast:
+            return pipe(
+                prompt=prompt,
+                negative_prompt=neg,
+                num_frames=frames,
+                height=size,
+                width=size,
+                num_inference_steps=steps,
+                guidance_scale=cfg_scale,
+                generator=generator,
             )
-        elif requested in ["ddim"]:
-            pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
-        elif requested in ["unipc", "unipc_multistep"]:
-            pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
-        else:
-            print(f"[Scheduler] Unknown '{requested}', keeping default.")
-            print(f"[Scheduler] Using: {pipe.scheduler.__class__.__name__}")
-            return
-        print(f"[Scheduler] Using: {pipe.scheduler.__class__.__name__}")
-    except Exception as e:
-        print(f"[Scheduler] Failed to set '{requested}' ({e}); keeping default "
-              f"{pipe.scheduler.__class__.__name__}.")
+
+    # If CUDA available, try in a MAGMA-pref context first
+    if pref is not None:
+        try:
+            with pref("magma"):
+                return _call()
+        except RuntimeError as e:
+            msg = str(e)
+            if "cusolver" in msg.lower() or "cusolverDnCreate" in msg:
+                # Retry once more with MAGMA (already set) just in case, else rethrow
+                return _call()
+            raise
+    else:
+        return _call()
 
 
 def main():
@@ -118,7 +123,6 @@ def main():
     steps       = int(cfg["sampler"]["steps"])
     cfg_scale   = float(cfg["sampler"]["cfg_scale"])
     neg_prompt  = cfg["sampler"].get("negative_prompt", None)
-    sched_req   = cfg.get("sampler", {}).get("scheduler", "default")
 
     classes   = cfg["dataset"]["classes"]
     per_class = int(cfg["dataset"]["per_class"])
@@ -133,24 +137,25 @@ def main():
     print(f"Loading WAN 2.1 ({model_name}) base checkpoint and LoRA (if present) …")
     pipe = DiffusionPipeline.from_pretrained(
         base_ckpt,
-        dtype=dtype,   # new diffusers arg name (ignored by WAN if unsupported)
+        dtype=dtype,   # ignored by WAN if unsupported; harmless
         variant=None,
     ).to(device)
 
-    # Respect flow-matching default unless explicitly changed (and compatible)
-    try_set_scheduler(pipe, sched_req)
+    # Keep WAN’s default scheduler (flow-matching / UniPC) — don’t override.
 
     # Load LoRA attention processors (directory saved via save_attn_procs)
-    if lora_path:
-        if os.path.isdir(lora_path):
-            try:
-                pipe.transformer.load_attn_procs(lora_path)
-                print(f"[LoRA] Loaded attention processors from: {lora_path}")
-            except Exception as e:
-                print(f"[LoRA] WARNING: Failed to load from '{lora_path}': {e}. Continuing base-only.")
-        else:
-            print(f"[LoRA] WARNING: '{lora_path}' is not a directory. Expected a folder saved via save_attn_procs(). "
-                  f"Continuing base-only.")
+    if maybe_warn_lora_dir(lora_path):
+        try:
+            pipe.transformer.load_attn_procs(lora_path)
+            print(f"[LoRA] Loaded attention processors from: {lora_path}")
+        except Exception as e:
+            print(f"[LoRA] WARNING: Failed to load from '{lora_path}': {e}. Continuing base-only.")
+
+    # Mild stability knobs (optional, safe):
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+    except Exception:
+        pass
 
     generator = torch.Generator(device=device).manual_seed(seed)
 
@@ -161,27 +166,20 @@ def main():
 
         for i in tqdm(range(per_class), desc=f"{cls:>12}"):
             prompt = f"a person performing {cls}"
-
-            ctx = (
-                torch.autocast(device_type="cuda", dtype=dtype)
-                if device == "cuda"
-                else torch.cpu.amp.autocast(dtype=torch.float32, enabled=False)
+            result = run_one(
+                pipe=pipe,
+                prompt=prompt,
+                neg=neg_prompt,
+                frames=frames,
+                size=size,
+                steps=steps,
+                cfg_scale=cfg_scale,
+                generator=generator,
+                device=device,
+                dtype=dtype,
             )
-            with torch.no_grad(), ctx:
-                result = pipe(
-                    prompt=prompt,
-                    negative_prompt=neg_prompt,
-                    num_frames=frames,
-                    height=size,
-                    width=size,
-                    num_inference_steps=steps,
-                    guidance_scale=cfg_scale,
-                    generator=generator,
-                )
 
-            # Diffusers WAN returns a list of frames
             frames_rgb = [to_hwc_uint8(fr) for fr in result.frames]
-
             path = cdir / f"{cls}_{i:02d}.mp4"
             imageio.mimwrite(path, frames_rgb, fps=fps)
 
