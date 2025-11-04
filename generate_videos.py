@@ -1,14 +1,14 @@
-# generate_videos.py — WAN 2.1 T2V gen + optional LoRA (OOM-hardened)
+# generate_videos.py — WAN 2.1 T2V gen + optional LoRA (time-chunked VAE decode)
 import os, argparse, yaml, warnings, gc
 from pathlib import Path
 
-# WAN needs ftfy for text cleanup
+# WAN needs ftfy for prompt cleanup
 try:
     import ftfy  # noqa: F401
 except Exception as e:
     raise RuntimeError("WAN pipeline requires `ftfy`.\nIn Colab:  pip -q install ftfy") from e
 
-# Try to reduce CUDA fragmentation early
+# Reduce CUDA fragmentation
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
@@ -17,6 +17,7 @@ from tqdm import tqdm
 from diffusers import DiffusionPipeline
 
 warnings.filterwarnings("ignore", category=UserWarning)
+torch.backends.cuda.matmul.allow_tf32 = True
 
 def load_cfg(path):
     with open(path, "r") as f:
@@ -58,41 +59,54 @@ def maybe_load_lora(pipe, lora_path: str):
         print(f"[LoRA] WARNING: failed to load from '{lora_path}': {e}. Continuing base-only.")
 
 def enable_memory_savers(pipe):
-    # These exist in Diffusers and help a lot during WAN decode
-    try: pipe.enable_attention_slicing("max")
-    except Exception: pass
-    try: pipe.enable_vae_slicing()
-    except Exception: pass
-    try: pipe.enable_vae_tiling()
-    except Exception: pass
-    # xFormers if Colab already has it
+    for fn in ("enable_attention_slicing", "enable_vae_slicing", "enable_vae_tiling"):
+        try: getattr(pipe, fn)()
+        except Exception: pass
     try:
         import xformers  # noqa: F401
         try: pipe.enable_xformers_memory_efficient_attention()
         except Exception: pass
     except Exception:
         pass
-    # TF32 matmul is okay for speed on Ampere
-    try: torch.backends.cuda.matmul.allow_tf32 = True
-    except Exception: pass
 
 def autocast_ctx(device, dtype):
     if device == "cuda":
         return torch.autocast(device_type="cuda", dtype=dtype)
     return torch.cpu.amp.autocast(dtype=torch.float32, enabled=False)
 
-def run_one(pipe, prompt, neg, frames, size, steps, cfg_scale, generator, device, dtype):
-    # Prefer MAGMA to dodge occasional cuSOLVER hiccups
-    prev_backend = None
-    if torch.cuda.is_available():
-        try: prev_backend = torch.backends.cuda.preferred_linalg_library()
-        except Exception: pass
-        try: torch.backends.cuda.preferred_linalg_library("magma")
-        except Exception: pass
+@torch.no_grad()
+def decode_in_time_chunks(vae, latents: torch.Tensor, t_chunk: int = 3):
+    """
+    latents: (B=1, C, T, H, W) — decode in small T slices to keep VRAM low.
+    Returns list of frames (HWC uint8).
+    """
+    # safety: keep vae on current device/dtype
+    frames_out = []
+    _, _, T, _, _ = latents.shape
+    # WAN VAE expects the exact shape; we only slice time dimension
+    for t0 in range(0, T, t_chunk):
+        t1 = min(T, t0 + t_chunk)
+        slab = latents[:, :, t0:t1]  # (1, C, t, H, W)
+        decoded = vae.decode(slab, return_dict=False)[0]  # (1, t, H, W, 3) or similar per WAN
+        # Convert to list of HWC uint8 frames
+        if isinstance(decoded, torch.Tensor):
+            dec = decoded.clamp(0, 255).to(torch.uint8).cpu().numpy()
+        else:
+            dec = decoded
+        # WAN returns (B, T, H, W, C); B==1
+        for k in range(dec.shape[1]):
+            frames_out.append(dec[0, k])
+        # minimize peak memory
+        del slab, decoded, dec
+        torch.cuda.empty_cache()
+        gc.collect()
+    return frames_out
 
-    try:
-        with torch.inference_mode(), autocast_ctx(device, dtype):
-            return pipe(
+def run_one(pipe, prompt, neg, frames, size, steps, cfg_scale, generator, device, dtype, t_chunk=3):
+    # Ask for LATENTS to avoid full-video decode inside the pipeline
+    with torch.inference_mode(), autocast_ctx(device, dtype):
+        try:
+            out = pipe(
                 prompt=prompt,
                 negative_prompt=neg,
                 num_frames=frames,
@@ -101,30 +115,46 @@ def run_one(pipe, prompt, neg, frames, size, steps, cfg_scale, generator, device
                 num_inference_steps=steps,
                 guidance_scale=cfg_scale,
                 generator=generator,
+                output_type="latent",     # <— key change
+                return_dict=True,
             )
-    except torch.cuda.OutOfMemoryError:
-        # Auto-retry smaller (halved res + fewer frames/steps), still valid for WAN
-        torch.cuda.empty_cache()
-        smaller = max(256, (size // 2) // 8 * 8)   # keep multiple of 8 just in case
-        fewer_frames = round_wan_frames(max(9, frames - 4))
-        fewer_steps  = max(12, steps // 2)
-        print(f"[OOM] Retrying with size {size}->{smaller}, frames {frames}->{fewer_frames}, steps {steps}->{fewer_steps}")
-        with torch.inference_mode(), autocast_ctx(device, dtype):
-            return pipe(
+        except torch.cuda.OutOfMemoryError:
+            # Retry smaller config if we OOM during denoise
+            torch.cuda.empty_cache()
+            size2 = max(256, (size // 2) // 8 * 8)
+            frames2 = round_wan_frames(max(9, frames - 4))
+            steps2 = max(12, steps // 2)
+            print(f"[OOM@denoise] Retrying with size {size}->{size2}, frames {frames}->{frames2}, steps {steps}->{steps2}")
+            out = pipe(
                 prompt=prompt,
                 negative_prompt=neg,
-                num_frames=fewer_frames,
-                height=smaller,
-                width=smaller,
-                num_inference_steps=fewer_steps,
+                num_frames=frames2,
+                height=size2,
+                width=size2,
+                num_inference_steps=steps2,
                 guidance_scale=cfg_scale,
                 generator=generator,
+                output_type="latent",
+                return_dict=True,
             )
-    finally:
-        # Restore previous linalg backend pref if known
-        if prev_backend is not None:
-            try: torch.backends.cuda.preferred_linalg_library(prev_backend)
-            except Exception: pass
+            size, frames, steps = size2, frames2, steps2
+
+    # Chunked VAE decode on the returned latents
+    latents = out.latents  # (1, C, T, H, W)
+    try:
+        frames_rgb = decode_in_time_chunks(pipe.vae, latents, t_chunk=t_chunk)
+    except torch.cuda.OutOfMemoryError:
+        # Last-ditch: cut chunk size further
+        torch.cuda.empty_cache()
+        gc.collect()
+        print("[OOM@decode] Retrying VAE decode with smaller time chunks (t_chunk=2)")
+        frames_rgb = decode_in_time_chunks(pipe.vae, latents, t_chunk=2)
+
+    # cleanup
+    del out, latents
+    torch.cuda.empty_cache()
+    gc.collect()
+    return frames_rgb
 
 def main():
     ap = argparse.ArgumentParser()
@@ -146,12 +176,13 @@ def main():
     steps      = int(cfg["sampler"]["steps"])
     cfg_scale  = float(cfg["sampler"]["cfg_scale"])
     neg_prompt = cfg["sampler"].get("negative_prompt", None)
+    t_chunk    = int(cfg.get("sampler", {}).get("vae_t_chunk", 3))
 
     classes    = cfg["dataset"]["classes"]
     per_class  = int(cfg["dataset"]["per_class"])
     out_dir    = Path(cfg["dataset"]["out_dir"]); out_dir.mkdir(parents=True, exist_ok=True)
 
-    # WAN requires (frames-1) % 4 == 0
+    # make WAN happy re: frames
     new_frames = round_wan_frames(frames)
     if new_frames != frames:
         print(f"[Note] Rounded frames {frames} → {new_frames} to satisfy WAN’s requirement.")
@@ -160,14 +191,13 @@ def main():
     print(f"Loading WAN 2.1 ({model_name}) base checkpoint and LoRA (if present) …")
     pipe = DiffusionPipeline.from_pretrained(
         base_ckpt,
-        dtype=dtype,   # WAN will ignore if unsupported; harmless
+        dtype=dtype,      # safe if ignored
         variant=None,
     ).to(device)
 
     enable_memory_savers(pipe)
     maybe_load_lora(pipe, lora_path)
 
-    # Generator on device for deterministic sampling
     generator = torch.Generator(device=device).manual_seed(seed)
 
     print("Generating videos …")
@@ -177,8 +207,7 @@ def main():
 
         for i in tqdm(range(per_class), desc=f"{cls:>12}"):
             prompt = f"a person performing {cls}"
-
-            result = run_one(
+            frames_rgb = run_one(
                 pipe=pipe,
                 prompt=prompt,
                 neg=neg_prompt,
@@ -189,14 +218,13 @@ def main():
                 generator=generator,
                 device=device,
                 dtype=dtype,
+                t_chunk=t_chunk,
             )
-
-            frames_rgb = [to_hwc_uint8(fr) for fr in result.frames]
             path = cdir / f"{cls}_{i:02d}.mp4"
-            imageio.mimwrite(path, frames_rgb, fps=fps)
+            imageio.mimwrite(path, [to_hwc_uint8(fr) for fr in frames_rgb], fps=fps)
 
-            # Free everything before the next sample
-            del result, frames_rgb
+            # scrub between samples
+            del frames_rgb
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
