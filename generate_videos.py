@@ -1,4 +1,4 @@
-# generate_videos.py — WAN 2.1 T2V generation + optional LoRA (Colab-safe linalg)
+# generate_videos.py — WAN 2.1 T2V generation + optional LoRA (Colab-safe linalg, no ctx mgr)
 import os, argparse, yaml, warnings
 from pathlib import Path
 
@@ -62,21 +62,39 @@ def maybe_warn_lora_dir(lora_path: str):
     return False
 
 
+def set_linalg_pref(new_pref: str):
+    """
+    Set CUDA linalg backend preference (e.g., 'magma' or 'cusolver') and return the previous value.
+    This is a setter function, not a context manager in current PyTorch builds.
+    """
+    if not torch.cuda.is_available():
+        return None
+    prev = None
+    try:
+        # Query current preference (returns a torch._C._LinalgBackend or str depending on version)
+        prev = torch.backends.cuda.preferred_linalg_library()
+    except Exception:
+        pass
+
+    try:
+        torch.backends.cuda.preferred_linalg_library(new_pref)
+    except Exception as e:
+        print(f"[Linalg] Could not set preferred backend to '{new_pref}': {e}")
+    return prev
+
+
+def autocast_ctx(device, dtype):
+    if device == "cuda":
+        return torch.autocast(device_type="cuda", dtype=dtype)
+    # CPU path: disable autocast
+    return torch.cpu.amp.autocast(dtype=torch.float32, enabled=False)
+
+
 def run_one(pipe, prompt, neg, frames, size, steps, cfg_scale, generator, device, dtype):
-    # Prefer MAGMA linalg on quirky Colab images to avoid cuSOLVER crashes
-    # You can also force this via YAML: compute.linalg: magma
-    pref = (torch.backends.cuda.preferred_linalg_library if torch.cuda.is_available()
-            else None)
-    linalg_pref = "magma"
-
-    ctx_autocast = (
-        torch.autocast(device_type="cuda", dtype=dtype)
-        if device == "cuda"
-        else torch.cpu.amp.autocast(dtype=torch.float32, enabled=False)
-    )
-
-    def _call():
-        with torch.no_grad(), ctx_autocast:
+    # Prefer MAGMA to dodge sporadic cuSOLVER crashes on Colab
+    prev_backend = set_linalg_pref("magma")
+    try:
+        with torch.no_grad(), autocast_ctx(device, dtype):
             return pipe(
                 prompt=prompt,
                 negative_prompt=neg,
@@ -87,20 +105,30 @@ def run_one(pipe, prompt, neg, frames, size, steps, cfg_scale, generator, device
                 guidance_scale=cfg_scale,
                 generator=generator,
             )
-
-    # If CUDA available, try in a MAGMA-pref context first
-    if pref is not None:
-        try:
-            with pref("magma"):
-                return _call()
-        except RuntimeError as e:
-            msg = str(e)
-            if "cusolver" in msg.lower() or "cusolverDnCreate" in msg:
-                # Retry once more with MAGMA (already set) just in case, else rethrow
-                return _call()
-            raise
-    else:
-        return _call()
+    except RuntimeError as e:
+        msg = str(e).lower()
+        if "cusolver" in msg or "cusolverdncreate" in msg:
+            # One more attempt after MAGMA set (sometimes first call trips)
+            with torch.no_grad(), autocast_ctx(device, dtype):
+                return pipe(
+                    prompt=prompt,
+                    negative_prompt=neg,
+                    num_frames=frames,
+                    height=size,
+                    width=size,
+                    num_inference_steps=steps,
+                    guidance_scale=cfg_scale,
+                    generator=generator,
+                )
+        raise
+    finally:
+        # Restore previous backend preference if we had one
+        if prev_backend is not None:
+            try:
+                # prev_backend may be enum-like; both forms are accepted
+                torch.backends.cuda.preferred_linalg_library(prev_backend)
+            except Exception:
+                pass
 
 
 def main():
@@ -151,7 +179,7 @@ def main():
         except Exception as e:
             print(f"[LoRA] WARNING: Failed to load from '{lora_path}': {e}. Continuing base-only.")
 
-    # Mild stability knobs (optional, safe):
+    # Mild stability knobs (optional, safe)
     try:
         torch.backends.cuda.matmul.allow_tf32 = True
     except Exception:
