@@ -1,4 +1,4 @@
-# generate_videos.py — WAN 2.1 T2V generation + optional LoRA + scheduler switch
+# generate_videos.py — WAN 2.1 T2V generation + optional LoRA
 import os, argparse, yaml, warnings
 from pathlib import Path
 
@@ -36,35 +36,13 @@ def pick_dtype(cfg):
     return torch.float16
 
 
-def set_scheduler(pipe, name: str):
-    name = (name or "euler").lower()
-    try:
-        if name in ["euler", "euler_discrete"]:
-            pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
-        elif name in ["dpmpp_2m", "dpmpp", "dpm++", "dpmsolver++"]:
-            pipe.scheduler = DPMSolverMultistepScheduler.from_config(
-                pipe.scheduler.config, algorithm_type="dpmsolver++"
-            )
-        elif name in ["ddim"]:
-            pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
-        elif name in ["unipc", "unipc_multistep"]:
-            pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
-        else:
-            print(f"[Scheduler] Unknown '{name}', defaulting to Euler.")
-            pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
-    except Exception as e:
-        print(f"[Scheduler] Failed to set '{name}' ({e}); falling back to Euler.")
-        pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
-    print(f"[Scheduler] Using: {pipe.scheduler.__class__.__name__}")
-
-
 def round_wan_frames(n: int) -> int:
     # WAN requires (num_frames - 1) divisible by 4; round to nearest valid
     if (n - 1) % 4 == 0:
         return n
     rounded = 4 * round((n - 1) / 4) + 1
     if rounded < 5:
-        rounded = 5  # minimal sane sequence
+        rounded = 5
     return int(rounded)
 
 
@@ -73,13 +51,51 @@ def to_hwc_uint8(frame) -> "np.ndarray":
         fr = frame.detach().clamp(0, 255).to(torch.uint8).cpu().numpy()
     else:
         # assume numpy
-        fr = frame
-        # trust pipeline outputs are already uint8-range; enforce type
         import numpy as np
-
+        fr = frame
         if fr.dtype != np.uint8:
             fr = fr.clip(0, 255).astype("uint8")
     return fr
+
+
+def try_set_scheduler(pipe, requested: str):
+    """
+    Keep WAN's default (flow-matching) scheduler unless user explicitly asks
+    AND the requested scheduler is compatible with the pipeline's prediction_type.
+    """
+    requested = (requested or "default").lower()
+    current_pred = getattr(pipe.scheduler.config, "prediction_type", None)
+    if requested in ["default", "auto", "keep", ""]:
+        print(f"[Scheduler] Keeping pipeline default: {pipe.scheduler.__class__.__name__} "
+              f"(prediction_type={current_pred})")
+        return
+
+    # If the pipeline uses flow-matching, many classic schedulers won't work.
+    if current_pred not in (None, "epsilon", "v_prediction"):
+        print(f"[Scheduler] Pipeline uses prediction_type='{current_pred}'. "
+              f"Requested '{requested}' may be incompatible. Keeping default.")
+        print(f"[Scheduler] Using: {pipe.scheduler.__class__.__name__}")
+        return
+
+    try:
+        if requested in ["euler", "euler_discrete"]:
+            pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
+        elif requested in ["dpmpp_2m", "dpmpp", "dpm++", "dpmsolver++"]:
+            pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+                pipe.scheduler.config, algorithm_type="dpmsolver++"
+            )
+        elif requested in ["ddim"]:
+            pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
+        elif requested in ["unipc", "unipc_multistep"]:
+            pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
+        else:
+            print(f"[Scheduler] Unknown '{requested}', keeping default.")
+            print(f"[Scheduler] Using: {pipe.scheduler.__class__.__name__}")
+            return
+        print(f"[Scheduler] Using: {pipe.scheduler.__class__.__name__}")
+    except Exception as e:
+        print(f"[Scheduler] Failed to set '{requested}' ({e}); keeping default "
+              f"{pipe.scheduler.__class__.__name__}.")
 
 
 def main():
@@ -95,19 +111,18 @@ def main():
     base_ckpt = cfg["model"]["base_ckpt"]
     lora_path = cfg["model"].get("lora_path", "")
 
-    seed = int(cfg.get("sampler", {}).get("seed", 42))
-    frames = int(cfg["sampler"]["frames"])
-    fps = int(cfg["sampler"]["fps"])
-    size = int(cfg["sampler"]["size"])
-    steps = int(cfg["sampler"]["steps"])
-    cfg_scale = float(cfg["sampler"]["cfg_scale"])
-    neg_prompt = cfg["sampler"].get("negative_prompt", None)
-    scheduler_name = cfg.get("sampler", {}).get("scheduler", "euler")
+    seed        = int(cfg.get("sampler", {}).get("seed", 42))
+    frames      = int(cfg["sampler"]["frames"])
+    fps         = int(cfg["sampler"]["fps"])
+    size        = int(cfg["sampler"]["size"])
+    steps       = int(cfg["sampler"]["steps"])
+    cfg_scale   = float(cfg["sampler"]["cfg_scale"])
+    neg_prompt  = cfg["sampler"].get("negative_prompt", None)
+    sched_req   = cfg.get("sampler", {}).get("scheduler", "default")
 
-    classes = cfg["dataset"]["classes"]
+    classes   = cfg["dataset"]["classes"]
     per_class = int(cfg["dataset"]["per_class"])
-    out_dir = Path(cfg["dataset"]["out_dir"])
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir   = Path(cfg["dataset"]["out_dir"]); out_dir.mkdir(parents=True, exist_ok=True)
 
     # Frame rounding (quietly comply with WAN's expectation)
     new_frames = round_wan_frames(frames)
@@ -118,14 +133,14 @@ def main():
     print(f"Loading WAN 2.1 ({model_name}) base checkpoint and LoRA (if present) …")
     pipe = DiffusionPipeline.from_pretrained(
         base_ckpt,
-        dtype=dtype,   # modern diffusers prefers `dtype`
+        dtype=dtype,   # new diffusers arg name (ignored by WAN if unsupported)
         variant=None,
     ).to(device)
 
-    # Swap scheduler if requested
-    set_scheduler(pipe, scheduler_name)
+    # Respect flow-matching default unless explicitly changed (and compatible)
+    try_set_scheduler(pipe, sched_req)
 
-    # Load LoRA (directory saved via `save_attn_procs`)
+    # Load LoRA attention processors (directory saved via save_attn_procs)
     if lora_path:
         if os.path.isdir(lora_path):
             try:
@@ -134,7 +149,8 @@ def main():
             except Exception as e:
                 print(f"[LoRA] WARNING: Failed to load from '{lora_path}': {e}. Continuing base-only.")
         else:
-            print(f"[LoRA] WARNING: '{lora_path}' is not a directory. Expected a folder saved via save_attn_procs(). Continuing base-only.")
+            print(f"[LoRA] WARNING: '{lora_path}' is not a directory. Expected a folder saved via save_attn_procs(). "
+                  f"Continuing base-only.")
 
     generator = torch.Generator(device=device).manual_seed(seed)
 
@@ -151,7 +167,6 @@ def main():
                 if device == "cuda"
                 else torch.cpu.amp.autocast(dtype=torch.float32, enabled=False)
             )
-
             with torch.no_grad(), ctx:
                 result = pipe(
                     prompt=prompt,
@@ -168,7 +183,6 @@ def main():
             frames_rgb = [to_hwc_uint8(fr) for fr in result.frames]
 
             path = cdir / f"{cls}_{i:02d}.mp4"
-            # imageio uses installed imageio-ffmpeg in Colab by default
             imageio.mimwrite(path, frames_rgb, fps=fps)
 
     print("✅ All videos generated successfully.")
