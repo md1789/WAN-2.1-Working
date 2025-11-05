@@ -1,4 +1,4 @@
-# generate_videos.py — WAN 2.1 T2V gen + optional LoRA (time-chunked VAE decode, robust latent extraction)
+# generate_videos.py — WAN 2.1 T2V gen + optional LoRA (robust latents/frames handling, chunked decode)
 import os, argparse, yaml, warnings, gc
 from pathlib import Path
 
@@ -86,33 +86,41 @@ def autocast_ctx(device, dtype):
     return torch.cpu.amp.autocast(dtype=torch.float32, enabled=False)
 
 
-def extract_latents(output):
+def extract_latents_or_frames(output):
     """
-    Handle multiple Diffusers/WAN return shapes for output_type='latent':
-    - output.latents (WanPipelineOutput w/ latents)
-    - dict-like {'latents': ...}
-    - tuple/list where [0] are latents
-    - some WAN builds stash 5D latents in .images (!)
+    Return either:
+      ("latents", 5D tensor)  or  ("frames", list/np/tensor already decoded)
+    Handles WAN/Diffusers variants that ignore output_type='latent'.
     """
-    # attr
+    # Preferred: latents
     if hasattr(output, "latents"):
-        return output.latents
-    # dict-like
+        return "latents", output.latents
     if isinstance(output, dict) and "latents" in output:
-        return output["latents"]
-    # weird but seen: 5D tensor in .images
+        return "latents", output["latents"]
+    # Some WAN builds stash 5D in images
     if hasattr(output, "images"):
         img = output.images
         if isinstance(img, torch.Tensor) and img.dim() == 5:
-            return img
-    # tuple/list
+            return "latents", img
     if isinstance(output, (list, tuple)) and len(output) > 0:
         cand = output[0]
         if isinstance(cand, torch.Tensor) and cand.dim() == 5:
-            return cand
+            return "latents", cand
         if isinstance(cand, dict) and "latents" in cand:
-            return cand["latents"]
-    raise RuntimeError("Could not locate latents in WAN output when output_type='latent'.")
+            return "latents", cand["latents"]
+
+    # Fallback: decoded frames (most common when output_type is ignored)
+    if hasattr(output, "frames"):
+        return "frames", output.frames
+    if isinstance(output, dict) and "frames" in output:
+        return "frames", output["frames"]
+    if hasattr(output, "images"):
+        return "frames", output.images
+    if isinstance(output, (list, tuple)) and len(output) > 0:
+        cand = output[0]
+        if isinstance(cand, (list, tuple)):
+            return "frames", cand
+    raise RuntimeError("Could not find latents or frames in WAN output.")
 
 
 @torch.no_grad()
@@ -126,7 +134,7 @@ def decode_in_time_chunks(vae, latents: torch.Tensor, t_chunk: int = 3):
     for t0 in range(0, T, t_chunk):
         t1 = min(T, t0 + t_chunk)
         slab = latents[:, :, t0:t1]  # (1, C, t, H, W)
-        decoded = vae.decode(slab, return_dict=False)[0]  # WAN returns (1, t, H, W, 3)
+        decoded = vae.decode(slab, return_dict=False)[0]  # (1, t, H, W, 3)
         if isinstance(decoded, torch.Tensor):
             dec = decoded.clamp(0, 255).to(torch.uint8).cpu().numpy()
         else:
@@ -139,52 +147,64 @@ def decode_in_time_chunks(vae, latents: torch.Tensor, t_chunk: int = 3):
     return frames_out
 
 
-def run_one(pipe, prompt, neg, frames, size, steps, cfg_scale, generator, device, dtype, t_chunk=3):
-    # Ask for LATENTS to avoid full-video decode inside the pipeline
+def denoise_request(pipe, prompt, neg, frames, size, steps, cfg_scale, generator, device, dtype, want_latents=True):
+    """
+    Make one pipeline call. If want_latents is True, ask for output_type='latent'.
+    Returns the raw pipeline output.
+    """
     with torch.inference_mode(), autocast_ctx(device, dtype):
-        try:
-            out = pipe(
-                prompt=prompt,
-                negative_prompt=neg,
-                num_frames=frames,
-                height=size,
-                width=size,
-                num_inference_steps=steps,
-                guidance_scale=cfg_scale,
-                generator=generator,
-                output_type="latent",
-                return_dict=True,
-            )
-        except torch.cuda.OutOfMemoryError:
-            torch.cuda.empty_cache()
-            size2 = max(256, (size // 2) // 8 * 8)
-            frames2 = round_wan_frames(max(9, frames - 4))
-            steps2 = max(12, steps // 2)
-            print(f"[OOM@denoise] Retrying with size {size}->{size2}, frames {frames}->{frames2}, steps {steps}->{steps2}")
-            out = pipe(
-                prompt=prompt,
-                negative_prompt=neg,
-                num_frames=frames2,
-                height=size2,
-                width=size2,
-                num_inference_steps=steps2,
-                guidance_scale=cfg_scale,
-                generator=generator,
-                output_type="latent",
-                return_dict=True,
-            )
-            size, frames, steps = size2, frames2, steps2
+        return pipe(
+            prompt=prompt,
+            negative_prompt=neg,
+            num_frames=frames,
+            height=size,
+            width=size,
+            num_inference_steps=steps,
+            guidance_scale=cfg_scale,
+            generator=generator,
+            **({"output_type": "latent"} if want_latents else {"output_type": "np"}),
+            return_dict=True,
+        )
 
-    latents = extract_latents(out)  # (1, C, T, H, W)
+
+def run_one(pipe, prompt, neg, frames, size, steps, cfg_scale, generator, device, dtype, t_chunk=3):
+    """
+    Strategy:
+      1) Try to get 'latents' (best for memory). If present, chunk-decode.
+      2) If no latents but 'frames' exist, use them directly.
+      3) If the call errors, retry once with output_type='np'.
+    """
     try:
-        frames_rgb = decode_in_time_chunks(pipe.vae, latents, t_chunk=t_chunk)
+        out = denoise_request(pipe, prompt, neg, frames, size, steps, cfg_scale, generator, device, dtype, want_latents=True)
+        kind, payload = extract_latents_or_frames(out)
     except torch.cuda.OutOfMemoryError:
         torch.cuda.empty_cache()
-        gc.collect()
-        print("[OOM@decode] Retrying VAE decode with smaller time chunks (t_chunk=2)")
-        frames_rgb = decode_in_time_chunks(pipe.vae, latents, t_chunk=2)
+        size2 = max(256, (size // 2) // 8 * 8)
+        frames2 = round_wan_frames(max(9, frames - 4))
+        steps2 = max(12, steps // 2)
+        print(f"[OOM@denoise] Retrying with size {size}->{size2}, frames {frames}->{frames2}, steps {steps}->{steps2}")
+        out = denoise_request(pipe, prompt, neg, frames2, size2, steps2, cfg_scale, generator, device, dtype, want_latents=True)
+        kind, payload = extract_latents_or_frames(out)
+        size, frames, steps = size2, frames2, steps2
+    except Exception as e:
+        print(f"[Warn] Latent request failed ({e}). Retrying with decoded frames.")
+        out = denoise_request(pipe, prompt, neg, frames, size, steps, cfg_scale, generator, device, dtype, want_latents=False)
+        kind, payload = extract_latents_or_frames(out)
 
-    del out, latents
+    if kind == "latents":
+        latents = payload  # (1, C, T, H, W)
+        try:
+            frames_rgb = decode_in_time_chunks(pipe.vae, latents, t_chunk=t_chunk)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            gc.collect()
+            print("[OOM@decode] Retrying VAE decode with smaller time chunks (t_chunk=2)")
+            frames_rgb = decode_in_time_chunks(pipe.vae, latents, t_chunk=2)
+    else:
+        # Already-decoded frames; normalize to HWC uint8 list
+        frames_rgb = [to_hwc_uint8(fr) for fr in payload]
+
+    del out
     torch.cuda.empty_cache()
     gc.collect()
     return frames_rgb
