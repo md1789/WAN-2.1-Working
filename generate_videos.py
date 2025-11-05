@@ -216,7 +216,10 @@ def run_one(pipe, prompt, neg, frames, size, steps, cfg_scale, generator, device
       3) If the call errors, retry once with output_type='np'.
     """
     try:
-        out = denoise_request(pipe, prompt, neg, frames, size, steps, cfg_scale, generator, device, dtype, want_latents=True)
+        out = denoise_request(
+            pipe, prompt, neg, frames, size, steps, cfg_scale, generator, device, dtype,
+            want_latents=False  # <-- was True
+        )
         kind, payload = extract_latents_or_frames(out)
     except torch.cuda.OutOfMemoryError:
         torch.cuda.empty_cache()
