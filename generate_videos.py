@@ -190,60 +190,79 @@ def decode_in_time_chunks(vae, latents: torch.Tensor, t_chunk: int = 3):
 def payload_to_frame_list(payload):
     import numpy as np, torch
 
-    # Already a list of frames?
+    def _np(a):  # torch->numpy
+        if isinstance(a, torch.Tensor):
+            a = a.detach().cpu()
+        return np.asarray(a)
+
+    def _to_list(frames):  # (T,H,W,C uint8) -> list[H,W,C]
+        if frames.dtype.kind == "f":
+            if frames.max() <= 1.01: frames = frames * 255.0
+        frames = np.clip(frames, 0, 255).astype(np.uint8, copy=False)
+        return [frames[t] for t in range(frames.shape[0])]
+
+    # If it's already a list of frames, normalize each
     if isinstance(payload, list):
         out = []
         for fr in payload:
-            if hasattr(fr, "numpy"):  # torch
-                fr = fr.detach().cpu().numpy()
-            fr = np.asarray(fr)
-            # If CHW, move to HWC
-            if fr.ndim == 3 and fr.shape[0] in (1,3,4) and fr.shape[-1] not in (1,3,4):
-                fr = np.transpose(fr, (1,2,0))
-            if fr.ndim == 2:  # gray -> RGB
+            fr = _np(fr)
+            if fr.ndim == 2:     # gray → RGB
                 fr = np.repeat(fr[..., None], 3, axis=2)
-            # scale float
+            if fr.ndim == 3 and fr.shape[0] in (1,3,4) and fr.shape[-1] not in (1,3,4):
+                fr = np.transpose(fr, (1,2,0))  # CHW→HWC
+            if fr.ndim != 3:  # fallback
+                fr = np.zeros((8,8,3), np.uint8)
             if fr.dtype.kind == "f":
-                fr = (np.clip(fr, 0, 1) * 255).astype(np.uint8)
-            elif fr.dtype != np.uint8:
-                fr = np.clip(fr, 0, 255).astype(np.uint8)
+                if fr.max() <= 1.01: fr = fr*255.0
+            fr = np.clip(fr,0,255).astype(np.uint8, copy=False)
             out.append(fr)
         return out
 
-    # Torch tensor?
-    if 'torch' in str(type(payload)):
-        t = payload.detach().cpu()
-        if t.dim() == 5:      # (B,T,C,H,W) or (B,T,H,W,C)
-            if t.size(2) in (1,3,4):     # (B,T,C,H,W)
-                t = t.permute(0,1,3,4,2) # -> (B,T,H,W,C)
-            t = t[0]                     # (T,H,W,C)
-        elif t.dim() == 4:    # (T,C,H,W) or (T,H,W,C)
-            if t.size(1) in (1,3,4):
-                t = t.permute(0,2,3,1)   # -> (T,H,W,C)
-        elif t.dim() == 3:    # (H,W,C) single frame
-            t = t[None]                 # (1,H,W,C)
-        arr = t.numpy()
-    else:
-        arr = np.asarray(payload)
+    arr = _np(payload)
 
-    # NumPy paths
-    if arr.ndim == 5:         # (B,T,H,W,C)
-        arr = arr[0]
-    if arr.ndim == 4:         # (T,H,W,C)
-        frames = arr
-    elif arr.ndim == 3:       # (H,W,C)
-        frames = arr[None]
+    # Torch shapes we like
+    if arr.ndim == 5:  # (B,T,?, ?, ?)
+        # Guess channel axis: the dim with size in {1,3,4}
+        ch_ax = [i for i,s in enumerate(arr.shape) if s in (1,3,4)][-1]  # prefer the last small one
+        arr = np.moveaxis(arr, ch_ax, -1)  # → put C last
+        arr = arr[0]                       # drop B: (T, H, W, C) or (H, W, T, C) etc.
+    elif arr.ndim == 4:
+        # Identify channel axis (size in {1,3,4}) and time axis (the remaining largest axis)
+        sizes = list(arr.shape)
+        ch_candidates = [i for i,s in enumerate(sizes) if s in (1,3,4)]
+        ch_ax = ch_candidates[-1] if ch_candidates else None
+        if ch_ax is not None and ch_ax != 3:
+            arr = np.moveaxis(arr, ch_ax, 3)  # channel to last
+
+        # After moving C→last, choose T = the non-spatial axis with largest size
+        # Heuristic: H≈W≥16; T is the axis (0 or 1 or 2) not equal to C (now 3) with size not matching the others.
+        # Try common patterns:
+        if arr.shape[0] not in (1, arr.shape[1], arr.shape[2]):   # (T,H,W,C)
+            pass
+        elif arr.shape[2] not in (arr.shape[0], arr.shape[1]):    # (H,W,T,C)
+            arr = np.moveaxis(arr, 2, 0)                          # → (T,H,W,C)
+        elif arr.shape[1] not in (arr.shape[0], arr.shape[2]):    # (H,T,W,C)
+            arr = np.moveaxis(arr, 1, 0)                          # → (T,H,W,C)
+        else:
+            # If ambiguous and tiny width showed up (like 5), try swapping first two axes
+            if arr.shape[2] <= 8 and arr.shape[0] >= 9:
+                arr = np.moveaxis(arr, 2, 0)
+    elif arr.ndim == 3:  # single frame (H,W,C) or (C,H,W)
+        if arr.shape[0] in (1,3,4) and arr.shape[-1] not in (1,3,4):
+            arr = np.transpose(arr, (1,2,0))   # CHW→HWC
+        arr = arr[None]  # (1,H,W,C)
     else:
         raise ValueError(f"Unexpected payload shape: {arr.shape}")
 
-    # Float->uint8
-    if frames.dtype.kind == "f":
-        m = frames.max()
-        if m <= 1.01:
-            frames = frames * 255.0
-        frames = np.clip(frames, 0, 255).astype(np.uint8)
+    # If grayscale
+    if arr.ndim == 4 and arr.shape[-1] == 1:
+        arr = np.repeat(arr, 3, axis=3)
+    # Sanity
+    if arr.ndim != 4 or arr.shape[-1] not in (3,4,1):
+        # last resort: one black frame
+        arr = np.zeros((1, 8, 8, 3), dtype=np.uint8)
 
-    return [frames[t] for t in range(frames.shape[0])]
+    return _to_list(arr)
 
 
 def denoise_request(pipe, prompt, neg, frames, size, steps, cfg_scale, generator, device, dtype, want_latents=True):
@@ -305,8 +324,16 @@ def run_one(pipe, prompt, neg, frames, size, steps, cfg_scale, generator, device
     else:
         # Already-decoded frames; normalize to HWC uint8 list
         frames_rgb = [to_hwc_uint8(fr) for fr in payload]
-
+    
+    print("[debug] payload type:", type(payload))
+    try:
+        shp = payload.shape
+    except:
+        shp = [getattr(x, "shape", None) for x in (payload if isinstance(payload,(list,tuple)) else [payload])]
+    print("[debug] payload shape(s):", shp)
+    print("[debug] frames asked:", frames)
     frames_rgb = payload_to_frame_list(payload)
+
     del out
     torch.cuda.empty_cache()
     gc.collect()
