@@ -41,14 +41,48 @@ def round_wan_frames(n: int) -> int:
 
 
 def to_hwc_uint8(frame) -> "np.ndarray":
+    import numpy as np
+
+    # -> numpy
     if isinstance(frame, torch.Tensor):
-        fr = frame.detach().clamp(0, 255).to(torch.uint8).cpu().numpy()
+        arr = frame.detach().cpu().numpy()
     else:
-        import numpy as np
-        fr = frame
-        if fr.dtype != np.uint8:
-            fr = fr.clip(0, 255).astype("uint8")
-    return fr
+        arr = np.asarray(frame)
+
+    # Squeeze singleton dims (e.g., (1, H, W, 3), (H, W, 1), etc.)
+    arr = np.squeeze(arr)
+
+    # If we somehow still have >3 dims (e.g., (T, H, W, 3)), take the first slice until 3D.
+    while arr.ndim > 3:
+        arr = arr[0]
+
+    if arr.ndim == 2:
+        # grayscale -> 3ch
+        arr = np.repeat(arr[..., None], 3, axis=2)
+
+    elif arr.ndim == 3:
+        # If channels is the FIRST dim (CHW), move it to the end -> HWC
+        if arr.shape[0] in (1, 2, 3, 4) and arr.shape[-1] > 4:
+            arr = np.transpose(arr, (1, 2, 0))
+        # If last dim still not a valid channel count but first dim is, transpose as well
+        if arr.shape[-1] not in (1, 2, 3, 4) and arr.shape[0] in (1, 2, 3, 4):
+            arr = np.transpose(arr, (1, 2, 0))
+
+        # If we ended up with 1 channel, expand to 3 for ffmpeg friendliness
+        if arr.shape[-1] == 1:
+            arr = np.repeat(arr, 3, axis=2)
+
+    else:
+        # Safety: if it's 1D or empty by some freak chance, bail with a tiny black frame
+        arr = np.zeros((8, 8, 3), dtype=np.uint8)
+
+    # Scale floats in [0,1] to [0,255]
+    if np.issubdtype(arr.dtype, np.floating) and arr.max() <= 1.01:
+        arr = arr * 255.0
+
+    arr = np.clip(arr, 0, 255).astype(np.uint8, copy=False)
+    return arr
+
 
 
 def maybe_load_lora(pipe, lora_path: str):
