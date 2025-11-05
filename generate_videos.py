@@ -187,6 +187,64 @@ def decode_in_time_chunks(vae, latents: torch.Tensor, t_chunk: int = 3):
         gc.collect()
     return frames_out
 
+def payload_to_frame_list(payload):
+    import numpy as np, torch
+
+    # Already a list of frames?
+    if isinstance(payload, list):
+        out = []
+        for fr in payload:
+            if hasattr(fr, "numpy"):  # torch
+                fr = fr.detach().cpu().numpy()
+            fr = np.asarray(fr)
+            # If CHW, move to HWC
+            if fr.ndim == 3 and fr.shape[0] in (1,3,4) and fr.shape[-1] not in (1,3,4):
+                fr = np.transpose(fr, (1,2,0))
+            if fr.ndim == 2:  # gray -> RGB
+                fr = np.repeat(fr[..., None], 3, axis=2)
+            # scale float
+            if fr.dtype.kind == "f":
+                fr = (np.clip(fr, 0, 1) * 255).astype(np.uint8)
+            elif fr.dtype != np.uint8:
+                fr = np.clip(fr, 0, 255).astype(np.uint8)
+            out.append(fr)
+        return out
+
+    # Torch tensor?
+    if 'torch' in str(type(payload)):
+        t = payload.detach().cpu()
+        if t.dim() == 5:      # (B,T,C,H,W) or (B,T,H,W,C)
+            if t.size(2) in (1,3,4):     # (B,T,C,H,W)
+                t = t.permute(0,1,3,4,2) # -> (B,T,H,W,C)
+            t = t[0]                     # (T,H,W,C)
+        elif t.dim() == 4:    # (T,C,H,W) or (T,H,W,C)
+            if t.size(1) in (1,3,4):
+                t = t.permute(0,2,3,1)   # -> (T,H,W,C)
+        elif t.dim() == 3:    # (H,W,C) single frame
+            t = t[None]                 # (1,H,W,C)
+        arr = t.numpy()
+    else:
+        arr = np.asarray(payload)
+
+    # NumPy paths
+    if arr.ndim == 5:         # (B,T,H,W,C)
+        arr = arr[0]
+    if arr.ndim == 4:         # (T,H,W,C)
+        frames = arr
+    elif arr.ndim == 3:       # (H,W,C)
+        frames = arr[None]
+    else:
+        raise ValueError(f"Unexpected payload shape: {arr.shape}")
+
+    # Float->uint8
+    if frames.dtype.kind == "f":
+        m = frames.max()
+        if m <= 1.01:
+            frames = frames * 255.0
+        frames = np.clip(frames, 0, 255).astype(np.uint8)
+
+    return [frames[t] for t in range(frames.shape[0])]
+
 
 def denoise_request(pipe, prompt, neg, frames, size, steps, cfg_scale, generator, device, dtype, want_latents=True):
     """
@@ -248,6 +306,7 @@ def run_one(pipe, prompt, neg, frames, size, steps, cfg_scale, generator, device
         # Already-decoded frames; normalize to HWC uint8 list
         frames_rgb = [to_hwc_uint8(fr) for fr in payload]
 
+    frames_rgb = payload_to_frame_list(payload)
     del out
     torch.cuda.empty_cache()
     gc.collect()
