@@ -16,7 +16,8 @@ import torch
 import imageio.v2 as imageio
 from tqdm import tqdm
 from diffusers import DiffusionPipeline
-from diffusers import HunyuanVideoFramepackPipeline, HunyuanVideoFramepackTransformer3DModel
+from transformers import SiglipImageProcessor, SiglipVisionModel
+from diffusers import HunyuanVideoFramepackTransformer3DModel, HunyuanVideoFramepackPipeline
 
 
 warnings.filterwarnings("ignore", category=UserWarning)
