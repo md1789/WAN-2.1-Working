@@ -8,30 +8,46 @@ try:
 except Exception as e:
     raise RuntimeError("WAN pipeline requires `ftfy`.\nIn Colab:  pip -q install ftfy") from e
 
-# Reduce CUDA fragmentation
+# Reduce CUDA fragmentation / noisy tokenizer threading
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
+import numpy as np
 import torch
 import imageio.v2 as imageio
 from tqdm import tqdm
-from diffusers import DiffusionPipeline
-from diffusers import HunyuanVideoFramepackPipeline, HunyuanVideoFramepackTransformer3DModel
 
-# --- SigLIP image processor import shim ---
+from diffusers import DiffusionPipeline
+from diffusers import (
+    HunyuanVideoFramepackPipeline,
+    HunyuanVideoFramepackTransformer3DModel,
+)
+
+# --- SigLIP image processor import shim (transformers version tolerant) ---
 try:
-    # Newer Transformers (≈4.41+)
+    # Transformers ≥ ~4.41
     from transformers import SiglipImageProcessor
 except Exception:
     try:
-        # Fallback: use AutoImageProcessor (works across versions)
+        # Works across many versions
         from transformers import AutoImageProcessor as SiglipImageProcessor
     except Exception:
-        # Last resort: unified AutoProcessor (very new versions)
+        # Very new unified API fallback
         from transformers import AutoProcessor as SiglipImageProcessor
-# ------------------------------------------
+# -------------------------------------------------------------------------
 
-
+# --- SigLIP vision encoder import shim (transformers version tolerant) ---
+try:
+    # Preferred
+    from transformers import SiglipVisionModel
+except Exception:
+    try:
+        # Generic vision model fallback
+        from transformers import AutoModel as SiglipVisionModel
+    except Exception:
+        # Last resort (not ideal, but unblocks envs)
+        from transformers import CLIPVisionModel as SiglipVisionModel
+# -------------------------------------------------------------------------
 
 warnings.filterwarnings("ignore", category=UserWarning)
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -60,46 +76,42 @@ def round_wan_frames(n: int) -> int:
 
 
 def to_hwc_uint8(frame) -> "np.ndarray":
-    import numpy as np
-    import torch
+    # Accepts tensor/np/list; returns HWC uint8
+    import numpy as _np
+    import torch as _torch
 
-    # 1) torch -> numpy
-    arr = frame.detach().cpu().numpy() if isinstance(frame, torch.Tensor) else np.asarray(frame)
+    arr = frame.detach().cpu().numpy() if isinstance(frame, _torch.Tensor) else _np.asarray(frame)
 
-    # 2) If 4D, peel batch/time without guessing channels too hard
     if arr.ndim == 4:
         if arr.shape[-1] in (1, 3, 4):
-            arr = arr[0]  # drop leading (B or T)
+            arr = arr[0]
         else:
             small_axes = [i for i, s in enumerate(arr.shape) if s in (1, 2, 3, 4)]
             if small_axes:
-                arr = np.moveaxis(arr, small_axes[0], -1)
+                arr = _np.moveaxis(arr, small_axes[0], -1)
             while arr.ndim > 3:
                 arr = arr[0]
 
-    # 3) If CHW, fix to HWC
     if arr.ndim == 3 and arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
-        arr = np.transpose(arr, (1, 2, 0))  # CHW -> HWC
+        arr = _np.transpose(arr, (1, 2, 0))  # CHW -> HWC
 
-    # 4) If grayscale, replicate -> RGB
     if arr.ndim == 2:
-        arr = np.repeat(arr[..., None], 3, axis=2)
+        arr = _np.repeat(arr[..., None], 3, axis=2)
 
-    # 5) Final sanity
     if arr.ndim != 3:
-        arr = np.zeros((8, 8, 3), dtype=np.uint8)
+        arr = _np.zeros((8, 8, 3), dtype=_np.uint8)
+
     H, W, C = arr.shape
     if C == 1:
-        arr = np.repeat(arr, 3, axis=2)
+        arr = _np.repeat(arr, 3, axis=2)
     elif C == 2:
-        arr = np.repeat(arr[..., :1], 3, axis=2)
+        arr = _np.repeat(arr[..., :1], 3, axis=2)
     elif C > 4:
         arr = arr[..., :3]
 
-    # 6) Scale floats if in [0,1], then clamp → uint8
-    if np.issubdtype(arr.dtype, np.floating) and arr.max() <= 1.01:
+    if _np.issubdtype(arr.dtype, _np.floating) and arr.max() <= 1.01:
         arr = arr * 255.0
-    return np.clip(arr, 0, 255).astype(np.uint8, copy=False)
+    return _np.clip(arr, 0, 255).astype(_np.uint8, copy=False)
 
 
 def maybe_load_lora(pipe, lora_path: str):
@@ -116,11 +128,21 @@ def maybe_load_lora(pipe, lora_path: str):
 
 
 def enable_memory_savers(pipe):
-    for fn in ("enable_attention_slicing", "enable_vae_slicing", "enable_vae_tiling"):
+    for fn in ("enable_attention_slicing",):
         try:
             getattr(pipe, fn)()
         except Exception:
             pass
+    # VAE tiling/slicing (pipeline may or may not expose .vae)
+    try:
+        pipe.vae.enable_tiling()
+    except Exception:
+        pass
+    try:
+        pipe.vae.enable_slicing()
+    except Exception:
+        pass
+    # xFormers if present
     try:
         import xformers  # noqa: F401
         try:
@@ -131,28 +153,21 @@ def enable_memory_savers(pipe):
         pass
 
 
-def autocast_ctx(device, dtype):
-    if device == "cuda":
-        return torch.autocast(device_type="cuda", dtype=dtype)
-    return torch.cpu.amp.autocast(dtype=torch.float32, enabled=False)
-
-
 def extract_latents_or_frames(output):
     """
     Return either:
       ("latents", 5D tensor)  or  ("frames", list/np/tensor already decoded)
-    Handles WAN/Diffusers variants that ignore output_type='latent'.
     """
-    # Preferred: latents
     if hasattr(output, "latents"):
         return "latents", output.latents
     if isinstance(output, dict) and "latents" in output:
         return "latents", output["latents"]
-    # Some WAN builds stash 5D in images
+
     if hasattr(output, "images"):
         img = output.images
         if isinstance(img, torch.Tensor) and img.dim() == 5:
             return "latents", img
+
     if isinstance(output, (list, tuple)) and len(output) > 0:
         cand = output[0]
         if isinstance(cand, torch.Tensor) and cand.dim() == 5:
@@ -160,18 +175,14 @@ def extract_latents_or_frames(output):
         if isinstance(cand, dict) and "latents" in cand:
             return "latents", cand["latents"]
 
-    # Fallback: decoded frames
-    if hasattr(output, "frames"):
-        return "frames", output.frames
-    if isinstance(output, dict) and "frames" in output:
-        return "frames", output["frames"]
-    if hasattr(output, "images"):
-        return "frames", output.images
-    if isinstance(output, (list, tuple)) and len(output) > 0:
-        cand = output[0]
-        if isinstance(cand, (list, tuple)):
-            return "frames", cand
-    raise RuntimeError("Could not find latents or frames in WAN output.")
+    # Decoded frames paths
+    for key in ("frames", "images", "videos"):
+        if hasattr(output, key):
+            return "frames", getattr(output, key)
+        if isinstance(output, dict) and key in output:
+            return "frames", output[key]
+
+    raise RuntimeError("Could not find latents or frames in pipeline output.")
 
 
 @torch.no_grad()
@@ -199,128 +210,187 @@ def decode_in_time_chunks(vae, latents: torch.Tensor, t_chunk: int = 3):
 
 
 def payload_to_frame_list(payload):
-    import numpy as np, torch
+    import numpy as _np, torch as _torch
 
-    def _np(a):
-        if isinstance(a, torch.Tensor):
+    def _npify(a):
+        if isinstance(a, _torch.Tensor):
             a = a.detach().cpu()
-        return np.asarray(a)
+        return _np.asarray(a)
 
     def _to_list(frames):
-        if frames.dtype.kind == "f":
-            if frames.max() <= 1.01:
-                frames = frames * 255.0
-        frames = np.clip(frames, 0, 255).astype(np.uint8, copy=False)
+        if frames.dtype.kind == "f" and frames.max() <= 1.01:
+            frames = frames * 255.0
+        frames = _np.clip(frames, 0, 255).astype(_np.uint8, copy=False)
         return [frames[t] for t in range(frames.shape[0])]
 
     if isinstance(payload, list):
         out = []
         for fr in payload:
-            fr = _np(fr)
+            fr = _npify(fr)
             if fr.ndim == 2:
-                fr = np.repeat(fr[..., None], 3, axis=2)
+                fr = _np.repeat(fr[..., None], 3, axis=2)
             if fr.ndim == 3 and fr.shape[0] in (1, 3, 4) and fr.shape[-1] not in (1, 3, 4):
-                fr = np.transpose(fr, (1, 2, 0))  # CHW → HWC
+                fr = _np.transpose(fr, (1, 2, 0))
             if fr.ndim != 3:
-                fr = np.zeros((8, 8, 3), np.uint8)
+                fr = _np.zeros((8, 8, 3), _np.uint8)
             if fr.dtype.kind == "f" and fr.max() <= 1.01:
                 fr = (fr * 255.0)
-            fr = np.clip(fr, 0, 255).astype(np.uint8, copy=False)
+            fr = _np.clip(fr, 0, 255).astype(_np.uint8, copy=False)
             out.append(fr)
         return out
 
-    arr = _np(payload)
+    arr = _npify(payload)
 
     if arr.ndim == 5:
         ch_ax = [i for i, s in enumerate(arr.shape) if s in (1, 3, 4)][-1]
-        arr = np.moveaxis(arr, ch_ax, -1)
+        arr = _np.moveaxis(arr, ch_ax, -1)
         arr = arr[0]
     elif arr.ndim == 4:
         sizes = list(arr.shape)
         ch_candidates = [i for i, s in enumerate(sizes) if s in (1, 3, 4)]
         ch_ax = ch_candidates[-1] if ch_candidates else None
         if ch_ax is not None and ch_ax != 3:
-            arr = np.moveaxis(arr, ch_ax, 3)
+            arr = _np.moveaxis(arr, ch_ax, 3)
         if arr.shape[0] not in (1, arr.shape[1], arr.shape[2]):   # (T,H,W,C)
             pass
         elif arr.shape[2] not in (arr.shape[0], arr.shape[1]):    # (H,W,T,C)
-            arr = np.moveaxis(arr, 2, 0)
+            arr = _np.moveaxis(arr, 2, 0)
         elif arr.shape[1] not in (arr.shape[0], arr.shape[2]):    # (H,T,W,C)
-            arr = np.moveaxis(arr, 1, 0)
+            arr = _np.moveaxis(arr, 1, 0)
         else:
             if arr.shape[2] <= 8 and arr.shape[0] >= 9:
-                arr = np.moveaxis(arr, 2, 0)
+                arr = _np.moveaxis(arr, 2, 0)
     elif arr.ndim == 3:
         if arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
-            arr = np.transpose(arr, (1, 2, 0))
+            arr = _np.transpose(arr, (1, 2, 0))
         arr = arr[None]
     else:
         raise ValueError(f"Unexpected payload shape: {arr.shape}")
 
     if arr.ndim == 4 and arr.shape[-1] == 1:
-        arr = np.repeat(arr, 3, axis=3)
+        arr = _np.repeat(arr, 3, axis=3)
     if arr.ndim != 4 or arr.shape[-1] not in (3, 4, 1):
-        arr = np.zeros((1, 8, 8, 3), dtype=np.uint8)
+        arr = _np.zeros((1, 8, 8, 3), dtype=_np.uint8)
 
     return _to_list(arr)
 
 
-def denoise_request(pipe, prompt, neg, frames, size, steps, cfg_scale, generator, device, dtype, sampling_type):
-    h, w = size
+def autocast_ctx(device, dtype):
+    # kept for future use if you want context managers externally
+    if device == "cuda":
+        return torch.autocast(device_type="cuda", dtype=dtype)
+    return torch.cpu.amp.autocast(dtype=torch.float32, enabled=False)
+
+
+def denoise_request(
+    pipe,
+    prompt,
+    neg,
+    frames,   # int (count) for WAN OR list-of-images for FramePack
+    size,     # int (square side length)
+    steps,
+    cfg_scale,
+    generator,
+    device,
+    dtype,
+    want_latents=False,
+):
+    # Treat size as square (H=W=size)
+    h = w = size
+
+    # Build base kwargs
     kwargs = dict(
         prompt=prompt,
         negative_prompt=neg,
-        height=h, width=w,
-        num_frames=(len(frames) if frames else 49),
+        height=h,
+        width=w,
         num_inference_steps=steps,
         guidance_scale=cfg_scale,
         generator=generator,
-        sampling_type=sampling_type,
     )
 
-    # >>> Framepack needs at least one image <<<
+    # Ask WAN for latents when desired (saves VRAM, we chunk-decode)
+    if want_latents:
+        kwargs["output_type"] = "latent"
+
+    # Handle FramePack vs WAN differences
     if isinstance(pipe, HunyuanVideoFramepackPipeline):
-        if not frames or len(frames) == 0:
-            raise ValueError("Framepack backend requires at least one init frame. Provide frames or switch to text-to-video.")
+        # FramePack requires at least one init frame image
+        if not isinstance(frames, (list, tuple)) or len(frames) == 0:
+            raise ValueError("Framepack backend requires at least one init frame. Provide frames or inject a dummy frame.")
         first = frames[0]
-        last  = frames[-1] if len(frames) > 1 else None
+        last = frames[-1] if len(frames) > 1 else None
         kwargs["image"] = first
         if last is not None:
             kwargs["last_image"] = last
+        kwargs["num_frames"] = len(frames)
+    else:
+        # WAN path: frames is an integer (count)
+        if not isinstance(frames, int):
+            raise ValueError("WAN backend expects `frames` as an int (frame count).")
+        kwargs["num_frames"] = frames
 
     out = pipe(**kwargs)
-    return out.frames[0] if hasattr(out, "frames") else out.videos[0]
+    # Try common keys in different api variants
+    if hasattr(out, "frames"):
+        return out.frames
+    if hasattr(out, "videos"):
+        return out.videos
+    if hasattr(out, "images"):
+        return out.images
+    return out
 
 
-def run_one(pipe, prompt, neg, frames, size, steps, cfg_scale, generator, device, dtype, t_chunk=3):
-    """
-    WAN path:
-      - Try latents first (output_type='latent'); chunk-decode via VAE.
-    FramePack path:
-      - Request decoded frames directly (output_type='np') for speed/compat.
-    """
+def run_one(
+    pipe,
+    prompt,
+    neg,
+    frames,      # int count for WAN; list-of-images for FramePack (will be synthesized if None)
+    size,        # int (square)
+    steps,
+    cfg_scale,
+    generator,
+    device,
+    dtype,
+    t_chunk=3,
+):
     is_framepack = isinstance(pipe, HunyuanVideoFramepackPipeline)
+
+    # If FramePack and frames is not a list, synthesize neutral init frames
+    if is_framepack and not isinstance(frames, (list, tuple)):
+        h = w = size
+        dummy = np.full((h, w, 3), 127, dtype=np.uint8)
+        frames = [dummy, dummy]  # first & last to satisfy API
 
     try:
         out = denoise_request(
             pipe, prompt, neg, frames, size, steps, cfg_scale, generator, device, dtype,
-            want_latents=not is_framepack
+            want_latents=(not is_framepack)
         )
         kind, payload = extract_latents_or_frames(out)
     except torch.cuda.OutOfMemoryError:
         torch.cuda.empty_cache()
         size2 = max(256, (size // 2) // 8 * 8)
-        frames2 = round_wan_frames(max(9, frames - 4)) if not is_framepack else max(9, frames - 4)
+        # For WAN reduce frame count; for FramePack keep at least two dummy frames
+        if is_framepack:
+            frames2 = frames  # already list
+        else:
+            frames2 = max(9, (frames if isinstance(frames, int) else 49) - 4)
+            frames2 = round_wan_frames(frames2)
         steps2 = max(12, steps // 2)
         print(f"[OOM@denoise] Retrying with size {size}->{size2}, frames {frames}->{frames2}, steps {steps}->{steps2}")
-        out = denoise_request(pipe, prompt, neg, frames2, size2, steps2, cfg_scale, generator, device, dtype,
-                              want_latents=not is_framepack)
+        out = denoise_request(
+            pipe, prompt, neg, frames2, size2, steps2, cfg_scale, generator, device, dtype,
+            want_latents=(not is_framepack)
+        )
         kind, payload = extract_latents_or_frames(out)
         size, frames, steps = size2, frames2, steps2
     except Exception as e:
-        print(f"[Warn] First request failed ({e}). Retrying with decoded frames.")
-        out = denoise_request(pipe, prompt, neg, frames, size, steps, cfg_scale, generator, device, dtype,
-                              want_latents=False)
+        print(f"[Warn] First request failed ({e}). Retrying with decoded frames path.")
+        out = denoise_request(
+            pipe, prompt, neg, frames, size, steps, cfg_scale, generator, device, dtype,
+            want_latents=False
+        )
         kind, payload = extract_latents_or_frames(out)
 
     if kind == "latents":
@@ -367,8 +437,19 @@ def load_pipeline(cfg, backend, dtype, device):
         torch_dtype=dtype,
     ).to(device)
 
-    pipe.enable_model_cpu_offload()
-    pipe.vae.enable_tiling()
+    # Offload + VAE helpers (guarded)
+    try:
+        pipe.enable_model_cpu_offload()
+    except Exception:
+        pass
+    try:
+        pipe.vae.enable_tiling()
+    except Exception:
+        pass
+    try:
+        pipe.vae.enable_slicing()
+    except Exception:
+        pass
 
     return pipe, "framepack"
 
@@ -387,9 +468,9 @@ def main():
 
     # ---- sampler / dataset config ----
     seed       = int(cfg.get("sampler", {}).get("seed", 42))
-    frames     = int(cfg["sampler"]["frames"])
+    frames     = int(cfg["sampler"]["frames"])          # WAN: count. FramePack: we synthesize if not provided separately.
     fps        = int(cfg["sampler"]["fps"])
-    size       = int(cfg["sampler"]["size"])
+    size       = int(cfg["sampler"]["size"])            # square side
     steps      = int(cfg["sampler"]["steps"])
     cfg_scale  = float(cfg["sampler"]["cfg_scale"])
     neg_prompt = cfg["sampler"].get("negative_prompt", None)
@@ -403,7 +484,7 @@ def main():
     pipe, backend = load_pipeline(cfg, backend, dtype, device)
     enable_memory_savers(pipe)
 
-    # WAN only: frame rounding rule
+    # WAN only: frame rounding rule and optional LoRA
     if backend == "wan":
         new_frames = round_wan_frames(frames)
         if new_frames != frames:
@@ -427,11 +508,12 @@ def main():
 
         for i in tqdm(range(per_class), desc=f"{cls:>12}"):
             prompt = f"a person performing {cls}"
+
             frames_rgb = run_one(
                 pipe=pipe,
                 prompt=prompt,
                 neg=neg_prompt,
-                frames=frames,
+                frames=frames,          # WAN: int; FramePack: function synthesizes neutral frames if not provided
                 size=size,
                 steps=steps,
                 cfg_scale=cfg_scale,
