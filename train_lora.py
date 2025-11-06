@@ -280,7 +280,7 @@ def main():
     lora_sd = collect_lora_state_dict(target_root)
     save_path = out_dir / "lora_only.pt"
     torch.save({"lora": lora_sd, "rank": r, "alpha": alpha, "target_patterns": target_patterns}, save_path)
-    print(f"✅ Training complete — LoRA adapters saved to {save_path}")
+    print(f"Training complete — LoRA adapters saved to {save_path}")
 
 if __name__ == "__main__":
     main()
