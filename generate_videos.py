@@ -16,7 +16,8 @@ import torch
 import imageio.v2 as imageio
 from tqdm import tqdm
 from diffusers import DiffusionPipeline
-from diffusers.pipelines.framepack import HunyuanVideoFramepackPipeline
+from diffusers import HunyuanVideoFramepackPipeline
+
 
 warnings.filterwarnings("ignore", category=UserWarning)
 torch.backends.cuda.matmul.allow_tf32 = True
