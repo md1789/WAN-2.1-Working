@@ -16,8 +16,7 @@ import torch
 import imageio.v2 as imageio
 from tqdm import tqdm
 from diffusers import DiffusionPipeline
-from transformers import SiglipImageProcessor, SiglipVisionModel
-from diffusers import HunyuanVideoFramepackTransformer3DModel, HunyuanVideoFramepackPipeline
+from diffusers import HunyuanVideoFramepackPipeline, HunyuanVideoFramepackTransformer3DModel
 
 
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -252,20 +251,31 @@ def payload_to_frame_list(payload):
     return _to_list(arr)
 
 
-def denoise_request(pipe, prompt, neg, frames, size, steps, cfg_scale, generator, device, dtype, want_latents=True):
-    with torch.inference_mode(), autocast_ctx(device, dtype):
-        return pipe(
-            prompt=prompt,
-            negative_prompt=neg,
-            num_frames=frames,
-            height=size,
-            width=size,
-            num_inference_steps=steps,
-            guidance_scale=cfg_scale,
-            generator=generator,
-            **({"output_type": "latent"} if want_latents else {"output_type": "np"}),
-            return_dict=True,
-        )
+def denoise_request(pipe, prompt, neg, frames, size, steps, cfg_scale, generator, device, dtype, sampling_type):
+    h, w = size
+    kwargs = dict(
+        prompt=prompt,
+        negative_prompt=neg,
+        height=h, width=w,
+        num_frames=(len(frames) if frames else 49),
+        num_inference_steps=steps,
+        guidance_scale=cfg_scale,
+        generator=generator,
+        sampling_type=sampling_type,
+    )
+
+    # >>> Framepack needs at least one image <<<
+    if isinstance(pipe, HunyuanVideoFramepackPipeline):
+        if not frames or len(frames) == 0:
+            raise ValueError("Framepack backend requires at least one init frame. Provide frames or switch to text-to-video.")
+        first = frames[0]
+        last  = frames[-1] if len(frames) > 1 else None
+        kwargs["image"] = first
+        if last is not None:
+            kwargs["last_image"] = last
+
+    out = pipe(**kwargs)
+    return out.frames[0] if hasattr(out, "frames") else out.videos[0]
 
 
 def run_one(pipe, prompt, neg, frames, size, steps, cfg_scale, generator, device, dtype, t_chunk=3):
