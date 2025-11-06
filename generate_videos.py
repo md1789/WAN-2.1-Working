@@ -18,6 +18,20 @@ from tqdm import tqdm
 from diffusers import DiffusionPipeline
 from diffusers import HunyuanVideoFramepackPipeline, HunyuanVideoFramepackTransformer3DModel
 
+# --- SigLIP image processor import shim ---
+try:
+    # Newer Transformers (≈4.41+)
+    from transformers import SiglipImageProcessor
+except Exception:
+    try:
+        # Fallback: use AutoImageProcessor (works across versions)
+        from transformers import AutoImageProcessor as SiglipImageProcessor
+    except Exception:
+        # Last resort: unified AutoProcessor (very new versions)
+        from transformers import AutoProcessor as SiglipImageProcessor
+# ------------------------------------------
+
+
 
 warnings.filterwarnings("ignore", category=UserWarning)
 torch.backends.cuda.matmul.allow_tf32 = True
