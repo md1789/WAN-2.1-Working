@@ -1,15 +1,21 @@
 model:
+  # --- WAN backend ---
   name: wan-2.1-1.3b
   base_ckpt: "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
-  lora_path: "outputs/lora_har/lora_ema_last"   # folder saved by train script; optional
+  lora_path: "outputs/lora_har/lora_ema_last"   # optional; safe to leave blank
+
+  # --- Framepack backend ---
+  framepack_ckpt: "TencentARC/HunyuanVideo"     # use official repo for HunyuanVideo/Framepack
 
 sampler:
-  frames: 16
+  frames: 32             # increase for longer videos
   fps: 8
   size: 448
   steps: 20
   cfg_scale: 6.0
   seed: 42
+  vae_t_chunk: 3         # safe default; lower for limited VRAM
+  negative_prompt: ""    # optional
 
 dataset:
   classes: ["walking", "running", "jumping", "waving"]

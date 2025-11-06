@@ -325,8 +325,18 @@ def load_pipeline(cfg, backend, dtype, device):
 
     # backend == "framepack"
     pipe = HunyuanVideoFramepackPipeline.from_pretrained(
-        cfg["model"]["framepack_ckpt"], torch_dtype=dtype
+        cfg["model"]["framepack_ckpt"],
+        dtype=dtype,
+        device_map=None,
+        ignore_mismatched_sizes=True,
+        resume_download=True,
+        low_cpu_mem_usage=True
     ).to(device)
+
+    # Inject dummy feature_extractor/image_encoder so pipeline initializes cleanly
+    pipe.feature_extractor = None
+    pipe.image_encoder = None
+
     return pipe, "framepack"
 
 
