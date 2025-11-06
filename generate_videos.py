@@ -16,7 +16,7 @@ import torch
 import imageio.v2 as imageio
 from tqdm import tqdm
 from diffusers import DiffusionPipeline
-from diffusers import HunyuanVideoFramepackPipeline
+from diffusers import HunyuanVideoFramepackPipeline, HunyuanVideoFramepackTransformer3DModel
 
 
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -323,19 +323,27 @@ def load_pipeline(cfg, backend, dtype, device):
         ).to(device)
         return pipe, "wan"
 
-    # backend == "framepack"
+    # --- FRAMEPACK ---
+    transformer = HunyuanVideoFramepackTransformer3DModel.from_pretrained(
+        cfg["model"]["framepack_transformer"], torch_dtype=dtype
+    )
+    feature_extractor = SiglipImageProcessor.from_pretrained(
+        cfg["model"]["framepack_flux"], subfolder="feature_extractor"
+    )
+    image_encoder = SiglipVisionModel.from_pretrained(
+        cfg["model"]["framepack_flux"], subfolder="image_encoder", torch_dtype=dtype
+    )
+
     pipe = HunyuanVideoFramepackPipeline.from_pretrained(
         cfg["model"]["framepack_ckpt"],
-        dtype=dtype,
-        device_map=None,
-        ignore_mismatched_sizes=True,
-        resume_download=True,
-        low_cpu_mem_usage=True
+        transformer=transformer,
+        feature_extractor=feature_extractor,
+        image_encoder=image_encoder,
+        torch_dtype=dtype,
     ).to(device)
 
-    # Inject dummy feature_extractor/image_encoder so pipeline initializes cleanly
-    pipe.feature_extractor = None
-    pipe.image_encoder = None
+    pipe.enable_model_cpu_offload()
+    pipe.vae.enable_tiling()
 
     return pipe, "framepack"
 

@@ -31,3 +31,7 @@ tensorflow-cpu>=2.12.0    # for I3D feature extractor (no GPU needed)
 tensorflow-hub>=0.15.0    # to load I3D weights
 torchmetrics>=1.4.0       # if you use torchmetrics.FVD
 pandas                    # for saving results to CSV
+
+accelerate
+ftfy
+imageio-ffmpeg

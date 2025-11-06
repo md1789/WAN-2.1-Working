@@ -1,11 +1,10 @@
 model:
-  # --- WAN backend ---
   name: wan-2.1-1.3b
   base_ckpt: "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
-  lora_path: "outputs/lora_har/lora_ema_last"   # optional; safe to leave blank
-
-  # --- Framepack backend ---
-  framepack_ckpt: "TencentARC/HunyuanVideo"     # use official repo for HunyuanVideo/Framepack
+  lora_path: "outputs/lora_har/lora_ema_last"
+  framepack_ckpt: "hunyuanvideo-community/HunyuanVideo"
+  framepack_transformer: "lllyasviel/FramePackI2V_HY"
+  framepack_flux: "lllyasviel/flux_redux_bfl"
 
 sampler:
   frames: 32             # increase for longer videos
