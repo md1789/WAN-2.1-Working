@@ -497,16 +497,16 @@ def run_one(
 
     # --- FRAMEPACK keyframes handling ---
     if is_framepack:
-        if not isinstance(frames, (list, tuple)):
-            kfs = None
-            init_dir = os.environ.get("FRAMEPACK_INIT_DIR", "").strip()
-            if init_dir:
-                kfs = _load_keyframes_from_dir(init_dir, size)
+        init_dir = os.environ.get("FRAMEPACK_INIT_DIR", "").strip() or "/content/keyframes/walking"
+        if os.path.exists(init_dir):
+            kfs = _load_keyframes_from_dir(init_dir, size)
             if not kfs:
-                kfs = _generate_dummy_keyframes(size)
-            frames = [_to_uint8_hwc(k) for k in kfs]
+                raise ValueError(f"No valid keyframes found in {init_dir}. Expected frame0.png and frame1.png.")
         else:
-            frames = [_to_uint8_hwc(k) for k in frames]
+            raise ValueError(f"FramePack init directory not found: {init_dir}")
+
+        frames = [_to_uint8_hwc(k) for k in kfs]
+
 
     # --- Generate video ---
     out = denoise_request(
