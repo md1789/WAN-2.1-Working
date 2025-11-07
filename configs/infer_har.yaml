@@ -20,4 +20,4 @@ sampler:
 dataset:
   classes: ["walking", "running", "jumping", "waving"]
   per_class: 1
-  out_dir: "outputs/samples"
+  out_dir: "content/WAN-2.1-Working/outputs/samples"
