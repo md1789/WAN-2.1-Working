@@ -228,7 +228,7 @@ def decode_in_time_chunks(vae, latents: torch.Tensor, t_chunk: int = 3):
     for t0 in range(0, T, t_chunk):
         t1 = min(T, t0 + t_chunk)
         slab = latents[:, :, t0:t1]                       # (1, C, t, H, W)
-        slab = slab * scale                               # crucial: rescale latents
+        slab = slab / scale  # correct rescaling for WAN latents
 
         decoded = vae.decode(slab, return_dict=False)[0]  # often returns in [-1, 1]
 
