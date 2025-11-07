@@ -16,6 +16,7 @@ sampler:
   seed: 42
   vae_t_chunk: 3         # safe default; lower for limited VRAM
   negative_prompt: ""    # optional
+  sampling_type: "inverted_anti_drifting"
 
 dataset:
   classes: ["walking", "running", "jumping", "waving"]

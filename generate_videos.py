@@ -389,6 +389,7 @@ def denoise_request(
     device,
     dtype,
     want_latents=False,
+    sampling_type=None,
 ):
     # Treat size as square (H=W=size)
     h = w = size
@@ -402,6 +403,9 @@ def denoise_request(
         guidance_scale=cfg_scale,
         generator=generator,
     )
+    if sampling_type is not None:
+        kwargs["sampling_type"] = sampling_type
+
     if neg is not None:
         # Some video pipelines ignore this; harmless if unsupported
         kwargs["negative_prompt"] = neg
@@ -594,15 +598,15 @@ def load_pipeline(cfg, backend, dtype, device):
         ).to(device)
         return pipe, "wan"
 
-    # --- FRAMEPACK ---
+    # --- FRAMEPACK: match official example repos & dtypes ---
     transformer = HunyuanVideoFramepackTransformer3DModel.from_pretrained(
-        cfg["model"]["framepack_transformer"], torch_dtype=dtype
+        cfg["model"]["framepack_transformer"], torch_dtype=torch.bfloat16
     )
     feature_extractor = SiglipImageProcessor.from_pretrained(
         cfg["model"]["framepack_flux"], subfolder="feature_extractor"
     )
     image_encoder = SiglipVisionModel.from_pretrained(
-        cfg["model"]["framepack_flux"], subfolder="image_encoder", torch_dtype=dtype
+        cfg["model"]["framepack_flux"], subfolder="image_encoder", torch_dtype=torch.float16
     )
 
     pipe = HunyuanVideoFramepackPipeline.from_pretrained(
@@ -610,22 +614,14 @@ def load_pipeline(cfg, backend, dtype, device):
         transformer=transformer,
         feature_extractor=feature_extractor,
         image_encoder=image_encoder,
-        torch_dtype=dtype,
+        torch_dtype=torch.float16,
     ).to(device)
 
-    # Offload + VAE helpers (guarded)
-    try:
-        pipe.enable_model_cpu_offload()
-    except Exception:
-        pass
-    try:
-        pipe.vae.enable_tiling()
-    except Exception:
-        pass
-    try:
-        pipe.vae.enable_slicing()
-    except Exception:
-        pass
+    # memory helpers
+    try: pipe.enable_model_cpu_offload()
+    except: pass
+    try: pipe.vae.enable_tiling()
+    except: pass
 
     return pipe, "framepack"
 
@@ -674,6 +670,7 @@ def main():
 
     classes   = cfg["dataset"]["classes"]
     per_class = int(cfg["dataset"]["per_class"])
+    sampling_type = cfg["sampler"].get("sampling_type", None)
 
     # ---- load pipeline and generate (unchanged) ----
     backend = args.backend
