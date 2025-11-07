@@ -512,12 +512,23 @@ def run_one(
     )
     kind, payload = extract_latents_or_frames(out)
 
-    # --- Decode ---
+    # --- Decode or pass through ---
     if kind == "latents":
         latents = payload
+        print(f"[Debug] Decoding latents with shape {latents.shape} ...")
         frames_rgb = decode_in_time_chunks(getattr(pipe, "vae", None), latents, t_chunk=t_chunk)
     else:
-        frames_rgb = payload_to_frame_list(payload)
+        # already decoded frames — WAN sometimes returns np arrays directly
+        arr = payload
+        if isinstance(arr, torch.Tensor):
+            arr = arr.detach().cpu().numpy()
+        arr = np.asarray(arr)
+        print(f"[Debug] Direct frame payload shape {arr.shape}, dtype={arr.dtype}, min={arr.min() if arr.size>0 else None}, max={arr.max() if arr.size>0 else None}")
+        if arr.max() <= 1.01:
+            arr = (arr * 255.0)
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+        frames_rgb = [arr[t] for t in range(arr.shape[0])] if arr.ndim == 4 else [arr]
+
 
     torch.cuda.empty_cache()
     gc.collect()
