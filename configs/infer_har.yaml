@@ -2,7 +2,7 @@ model:
   name: wan-2.1-1.3b
   base_ckpt: "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
   lora_path: "outputs/lora_har/lora_ema_last"
-  fframepack_ckpt: "hunyuanvideo-community/HunyuanVideo"
+  framepack_ckpt: "hunyuanvideo-community/HunyuanVideo"
   framepack_transformer: "lllyasviel/FramePackI2V_HY"
   framepack_flux: "lllyasviel/flux_redux_bfl"     # must match the exact encoder used when training
   framepack_t2i: "black-forest-labs/FLUX.1-dev"   
