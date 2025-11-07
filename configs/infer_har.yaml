@@ -2,9 +2,10 @@ model:
   name: wan-2.1-1.3b
   base_ckpt: "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
   lora_path: "outputs/lora_har/lora_ema_last"
-  framepack_ckpt: "hunyuanvideo-community/HunyuanVideo"
-  framepack_transformer: "lllyasviel/FramePackI2V_HY"
-  framepack_flux: "lllyasviel/flux_redux_bfl"
+  framepack_ckpt: "tencent/HunyuanVideo-Framepack"         # your actual FramePack pipeline ID
+  framepack_transformer: "tencent/HunyuanVideo-Framepack-Transformer"
+  framepack_flux: "google/siglip-so400m-patch14-384"       # must match the exact encoder used when training
+  framepack_t2i: "black-forest-labs/FLUX.1-dev"   
 
 sampler:
   frames: 32             # increase for longer videos
