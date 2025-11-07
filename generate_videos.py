@@ -155,33 +155,59 @@ def enable_memory_savers(pipe):
 
 def extract_latents_or_frames(output):
     """
-    Return either:
+    Normalize Diffusers outputs into either:
       ("latents", 5D tensor)  or  ("frames", list/np/tensor already decoded)
+    Handles: dicts, ImagePipelineOutput, tuples/lists, raw np.ndarray, PIL.Image lists.
     """
-    if hasattr(output, "latents"):
-        return "latents", output.latents
-    if isinstance(output, dict) and "latents" in output:
-        return "latents", output["latents"]
+    import numpy as _np
+    import torch as _torch
+    from PIL import Image as _PILImage
 
-    if hasattr(output, "images"):
-        img = output.images
-        if isinstance(img, torch.Tensor) and img.dim() == 5:
-            return "latents", img
+    # 1) None?
+    if output is None:
+        raise RuntimeError("Pipeline returned None.")
 
-    if isinstance(output, (list, tuple)) and len(output) > 0:
-        cand = output[0]
-        if isinstance(cand, torch.Tensor) and cand.dim() == 5:
-            return "latents", cand
-        if isinstance(cand, dict) and "latents" in cand:
-            return "latents", cand["latents"]
-
-    # Decoded frames paths
-    for key in ("frames", "images", "videos"):
+    # 2) Common object/dict forms
+    for key in ("latents", "frames", "videos", "images"):
         if hasattr(output, key):
-            return "frames", getattr(output, key)
+            val = getattr(output, key)
+            if key == "latents":
+                return "latents", val
+            return "frames", val
         if isinstance(output, dict) and key in output:
-            return "frames", output[key]
+            val = output[key]
+            if key == "latents":
+                return "latents", val
+            return "frames", val
 
+    # 3) Raw numpy array directly
+    if isinstance(output, _np.ndarray):
+        # Expect shape (T, H, W, C) or (B, T, H, W, C). We'll handle downstream.
+        return "frames", output
+
+    # 4) Tuple/list forms from return_dict=False
+    if isinstance(output, (list, tuple)) and len(output) > 0:
+        first = output[0]
+        # a) Tuple containing a single ndarray or frames list
+        if len(output) == 1 and (isinstance(first, _np.ndarray) or isinstance(first, list)):
+            return "frames", first
+        # b) List/tuple of PIL images
+        if isinstance(first, _PILImage.Image):
+            return "frames", list(output)
+        # c) List/tuple of ndarrays / tensors
+        if isinstance(first, (_np.ndarray, _torch.Tensor, dict)):
+            return "frames", list(output)
+
+    # 5) Last resort: if it's a torch.Tensor with 5D video
+    if isinstance(output, _torch.Tensor) and output.dim() == 5:
+        return "latents", output
+
+    # Debug breadcrumb so we can see what shape hit us
+    try:
+        print("[extract] Unrecognized output type:", type(output))
+        print("[extract] dir(output):", dir(output))
+    except Exception:
+        pass
     raise RuntimeError("Could not find latents or frames in pipeline output.")
 
 
@@ -298,24 +324,21 @@ def denoise_request(
     # Treat size as square (H=W=size)
     h = w = size
 
-    # Build base kwargs
+    # Base kwargs shared
     kwargs = dict(
         prompt=prompt,
-        negative_prompt=neg,
         height=h,
         width=w,
         num_inference_steps=steps,
         guidance_scale=cfg_scale,
         generator=generator,
     )
+    if neg is not None:
+        # Some video pipelines ignore this; harmless if unsupported
+        kwargs["negative_prompt"] = neg
 
-    # Ask WAN for latents when desired (saves VRAM, we chunk-decode)
-    if want_latents:
-        kwargs["output_type"] = "latent"
-
-    # Handle FramePack vs WAN differences
     if isinstance(pipe, HunyuanVideoFramepackPipeline):
-        # FramePack requires at least one init frame image
+        # FramePack: we want decoded frames; enforce ndarray return
         if not isinstance(frames, (list, tuple)) or len(frames) == 0:
             raise ValueError("Framepack backend requires at least one init frame. Provide frames or inject a dummy frame.")
         first = frames[0]
@@ -324,20 +347,22 @@ def denoise_request(
         if last is not None:
             kwargs["last_image"] = last
         kwargs["num_frames"] = len(frames)
+        # Ask for raw numpy and non-dict return to normalize outputs
+        kwargs["return_dict"] = False
+        kwargs["output_type"] = "np"
     else:
-        # WAN path: frames is an integer (count)
+        # WAN: frames is an integer count
         if not isinstance(frames, int):
             raise ValueError("WAN backend expects `frames` as an int (frame count).")
         kwargs["num_frames"] = frames
+        if want_latents:
+            kwargs["output_type"] = "latent"
+            kwargs["return_dict"] = True
+        else:
+            kwargs["output_type"] = "np"
+            kwargs["return_dict"] = False
 
     out = pipe(**kwargs)
-    # Try common keys in different api variants
-    if hasattr(out, "frames"):
-        return out.frames
-    if hasattr(out, "videos"):
-        return out.videos
-    if hasattr(out, "images"):
-        return out.images
     return out
 
 
