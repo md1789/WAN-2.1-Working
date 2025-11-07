@@ -49,37 +49,6 @@ except Exception:
         from transformers import CLIPVisionModel as SiglipVisionModel
 # -------------------------------------------------------------------------
 
-# --- Optional T2I for priming FramePack with real keyframes ---
-def make_keyframes_from_prompt(prompt, size, dtype, device, seed1=1234, seed2=1337, model_id="black-forest-labs/FLUX.1-dev"):
-    from diffusers import DiffusionPipeline
-    import numpy as _np
-    t2i = DiffusionPipeline.from_pretrained(model_id, torch_dtype=dtype).to(device)
-    h = w = size
-    g1 = torch.Generator(device=device).manual_seed(seed1)
-    g2 = torch.Generator(device=device).manual_seed(seed2)
-    img1 = t2i(prompt=prompt, height=h, width=w, num_inference_steps=28, guidance_scale=4.0, generator=g1).images[0]
-    # subtle motion/pose hint
-    img2 = t2i(prompt=prompt + ", different pose, motion blur, dynamic lighting",
-               height=h, width=w, num_inference_steps=28, guidance_scale=4.5, generator=g2).images[0]
-    return _np.asarray(img1), _np.asarray(img2)
-
-def load_keyframes_from_dir(init_dir, size):
-    # returns [first, last] as np.uint8 HWC
-    import glob, cv2, numpy as _np
-    paths = sorted([p for p in glob.glob(os.path.join(init_dir, "*")) if os.path.splitext(p)[1].lower() in [".png",".jpg",".jpeg",".webp"]])
-    if not paths:
-        raise ValueError(f"No keyframe images found in {init_dir}")
-    def _read(path):
-        im = cv2.imread(path, cv2.IMREAD_COLOR)
-        if im is None: raise ValueError(f"Failed to read {path}")
-        im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
-        im = cv2.resize(im, (size, size), interpolation=cv2.INTER_AREA)
-        return im
-    first = _read(paths[0])
-    last  = _read(paths[-1]) if len(paths) > 1 else None
-    return [first, last] if last is not None else [first]
-
-
 warnings.filterwarnings("ignore", category=UserWarning)
 torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -259,34 +228,27 @@ def decode_in_time_chunks(vae, latents: torch.Tensor, t_chunk: int = 3):
     for t0 in range(0, T, t_chunk):
         t1 = min(T, t0 + t_chunk)
         slab = latents[:, :, t0:t1]                       # (1, C, t, H, W)
-        slab = slab * scale                               # << crucial: rescale latents
+        slab = slab * scale                               # crucial: rescale latents
 
-        # Many VAEs return sample in [-1, 1]
-        decoded = vae.decode(slab, return_dict=False)[0]  # (1, t, H, W, 3) or (1, 3, t, H, W) depending on VAE
+        decoded = vae.decode(slab, return_dict=False)[0]  # often returns in [-1, 1]
 
         if isinstance(decoded, torch.Tensor):
-            # Normalize to [0, 255] safely
-            # Try the common [-1,1] -> [0,1] path; if it's already [0,1], this still behaves.
             img = (decoded.clamp(-1, 1) + 1.0) * 0.5
             img = (img * 255.0).clamp(0, 255).to(torch.uint8).cpu().numpy()
         else:
-            # Fallback for odd return types; best-effort clamp/scale
             import numpy as _np
             arr = _np.asarray(decoded)
             if arr.dtype.kind == "f":
-                # handle [-1,1] or [0,1]
                 if arr.min() < 0.0:
                     arr = (arr.clip(-1, 1) + 1.0) * 0.5
                 arr = (arr * 255.0)
             img = _np.clip(arr, 0, 255).astype(_np.uint8, copy=False)
 
-        # Ensure time dimension is [t] in position 1
-        # Expecting img shape (1, t, H, W, C)
+        # Expect img shape (1, t, H, W, C)
         if img.ndim == 5 and img.shape[1] == (t1 - t0):
             for k in range(img.shape[1]):
                 frames_out.append(img[0, k])
         else:
-            # Last-resort heuristics
             from numpy import moveaxis
             if img.ndim == 5 and img.shape[2] == (t1 - t0):
                 img = moveaxis(img, 2, 1)
@@ -371,18 +333,59 @@ def payload_to_frame_list(payload):
 
 
 def autocast_ctx(device, dtype):
-    # kept for future use if you want context managers externally
     if device == "cuda":
         return torch.autocast(device_type="cuda", dtype=dtype)
     return torch.cpu.amp.autocast(dtype=torch.float32, enabled=False)
+
+
+# --- Optional T2I for priming FramePack with real keyframes ---
+def make_keyframes_from_prompt(prompt, size, dtype, device, seed1=1234, seed2=1337, model_id="black-forest-labs/FLUX.1-dev"):
+    from diffusers import DiffusionPipeline
+    import numpy as _np
+    t2i = DiffusionPipeline.from_pretrained(model_id, torch_dtype=dtype).to(device)
+    h = w = size
+    g1 = torch.Generator(device=device).manual_seed(seed1)
+    g2 = torch.Generator(device=device).manual_seed(seed2)
+    img1 = t2i(prompt=prompt, height=h, width=w, num_inference_steps=28, guidance_scale=4.0, generator=g1).images[0]
+    img2 = t2i(prompt=prompt + ", different pose, motion blur, dynamic lighting",
+               height=h, width=w, num_inference_steps=28, guidance_scale=4.5, generator=g2).images[0]
+    return _np.asarray(img1), _np.asarray(img2)
+
+
+def _load_keyframes_from_dir(init_dir, size_px):
+    import numpy as _np
+    from pathlib import Path
+    from PIL import Image
+    p = Path(init_dir)
+    exts = {".png", ".jpg", ".jpeg", ".webp"}
+    paths = sorted([q for q in p.iterdir() if q.suffix.lower() in exts])
+    if not paths:
+        raise ValueError(f"No keyframe images found in {init_dir}")
+    def _read(path):
+        im = Image.open(path).convert("RGB").resize((size_px, size_px))
+        return _np.asarray(im)
+    first = _read(paths[0])
+    last  = _read(paths[-1]) if len(paths) > 1 else None
+    return [first] if last is None else [first, last]
+
+
+def _synthesize_second(img):
+    import numpy as _np
+    from PIL import Image
+    H, W = img.shape[:2]
+    im = Image.fromarray(img)
+    im = im.rotate(2.0, resample=Image.BILINEAR, expand=False)
+    canvas = Image.new("RGB", (W, H), (0, 0, 0))
+    canvas.paste(im, (2, 0))
+    return _np.asarray(canvas)
 
 
 def denoise_request(
     pipe,
     prompt,
     neg,
-    frames,   # int (count) for WAN OR list-of-images for FramePack
-    size,     # int (square side length)
+    frames,          # int for WAN OR list-of-images for FramePack
+    size,            # square side length
     steps,
     cfg_scale,
     generator,
@@ -390,11 +393,10 @@ def denoise_request(
     dtype,
     want_latents=False,
     sampling_type=None,
+    n_out_frames=None,  # desired output frames for FramePack
 ):
-    # Treat size as square (H=W=size)
     h = w = size
 
-    # Base kwargs shared
     kwargs = dict(
         prompt=prompt,
         height=h,
@@ -405,26 +407,23 @@ def denoise_request(
     )
     if sampling_type is not None:
         kwargs["sampling_type"] = sampling_type
-
     if neg is not None:
-        # Some video pipelines ignore this; harmless if unsupported
         kwargs["negative_prompt"] = neg
 
     if isinstance(pipe, HunyuanVideoFramepackPipeline):
-        # FramePack: we want decoded frames; enforce ndarray return
         if not isinstance(frames, (list, tuple)) or len(frames) == 0:
-            raise ValueError("Framepack backend requires at least one init frame. Provide frames or inject a dummy frame.")
+            raise ValueError("Framepack backend requires at least one init frame.")
         first = frames[0]
         last = frames[-1] if len(frames) > 1 else None
         kwargs["image"] = first
         if last is not None:
             kwargs["last_image"] = last
-        kwargs["num_frames"] = len(frames)
-        # Ask for raw numpy and non-dict return to normalize outputs
+        if n_out_frames is None:
+            raise ValueError("Framepack requires `n_out_frames` (desired video length).")
+        kwargs["num_frames"] = int(n_out_frames)
         kwargs["return_dict"] = False
         kwargs["output_type"] = "np"
     else:
-        # WAN: frames is an integer count
         if not isinstance(frames, int):
             raise ValueError("WAN backend expects `frames` as an int (frame count).")
         kwargs["num_frames"] = frames
@@ -452,15 +451,15 @@ def run_one(
     device,
     dtype,
     t_chunk=3,
+    sampling_type=None,
 ):
     """
     FramePack behavior:
       - If `frames` is a list/tuple, it's used as-is (expects [first, last] or list of frames).
       - If not provided as list/tuple:
          1) If env FRAMEPACK_INIT_DIR is set, loads first/last image from that dir.
-         2) Else, if helper `make_keyframes_from_prompt` exists, uses it to T2I-generate two keyframes.
+         2) Else, uses make_keyframes_from_prompt(...) to T2I-generate two keyframes.
          3) If only one keyframe is available, synthesize a second by small rotation/shift.
-         4) Otherwise, raises a clear error (no mid-gray dummies anymore).
     WAN behavior unchanged.
     """
     import numpy as _np
@@ -474,37 +473,10 @@ def run_one(
         if a.ndim == 3 and a.shape[0] in (1, 3, 4) and a.shape[-1] not in (1, 3, 4):
             a = _np.transpose(a, (1, 2, 0))  # CHW -> HWC
         if a.dtype.kind == "f":
-            # handle [0,1] or [-1,1]
             if a.min() < 0:
                 a = (a.clip(-1, 1) + 1.0) * 0.5
             a = a * 255.0
         return _np.clip(a, 0, 255).astype(_np.uint8, copy=False)
-
-    def _load_keyframes_from_dir(init_dir, size_px):
-        from pathlib import Path
-        from PIL import Image
-        p = Path(init_dir)
-        exts = {".png", ".jpg", ".jpeg", ".webp"}
-        paths = sorted([q for q in p.iterdir() if q.suffix.lower() in exts])
-        if not paths:
-            raise ValueError(f"No keyframe images found in {init_dir}")
-        def _read(path):
-            im = Image.open(path).convert("RGB").resize((size_px, size_px))
-            return _np.asarray(im)
-        first = _read(paths[0])
-        last  = _read(paths[-1]) if len(paths) > 1 else None
-        return [first] if last is None else [first, last]
-
-    def _synthesize_second(img):
-        # light rotation + slight translation using PIL, no OpenCV needed
-        from PIL import Image
-        H, W = img.shape[:2]
-        im = Image.fromarray(img)
-        im = im.rotate(2.0, resample=Image.BILINEAR, expand=False)
-        # translate by a couple of pixels
-        canvas = Image.new("RGB", (W, H), (0, 0, 0))
-        canvas.paste(im, (2, 0))
-        return _np.asarray(canvas)
 
     # ---- Build frames for FramePack if needed ----
     if is_framepack:
@@ -516,36 +488,44 @@ def run_one(
             if init_dir:
                 kfs = _load_keyframes_from_dir(init_dir, size)
 
-            # 2) If still none, try T2I helper if user defined it
-            if kfs is None and "make_keyframes_from_prompt" in globals():
+            # 2) If still none, try T2I helper
+            if kfs is None:
                 try:
-                    kfs = list(globals()["make_keyframes_from_prompt"](prompt, size, dtype, device))
+                    kfs = list(make_keyframes_from_prompt(prompt, size, dtype, device))
                 except Exception as e:
                     print(f"[FramePack] T2I keyframe generation failed: {e}")
 
-            # 3) If still none, hard fail (no gray dummies)
+            # 3) Hard fail if no keyframes
             if not kfs:
                 raise ValueError(
                     "FramePack requires real keyframes. "
-                    "Provide a frames list, set FRAMEPACK_INIT_DIR to a folder with images, "
-                    "or define make_keyframes_from_prompt(...) to auto-generate."
+                    "Provide frames list, set FRAMEPACK_INIT_DIR to a folder with images, "
+                    "or ensure make_keyframes_from_prompt(...) is available."
                 )
 
             # 4) If only one, synthesize a second
             if len(kfs) == 1:
                 kfs = [kfs[0], _synthesize_second(_to_uint8_hwc(kfs[0]))]
 
-            # Ensure uint8 HWC
             frames = [_to_uint8_hwc(k) for k in kfs]
         else:
-            # Ensure dtype/shape for user-provided frames
             frames = [_to_uint8_hwc(k) for k in frames]
+
+    # Desired output frame count for FramePack
+    n_out_frames = None
+    if is_framepack and isinstance(frames, list):
+        # The caller passes WAN's frame count in `frames` param during main(),
+        # but here `frames` is now the keyframe list. We'll get the desired count
+        # by reading from an env override or leave it to caller via main() pass-through.
+        pass  # main() will pass n_out_frames explicitly via denoise_request()
 
     # ---- Denoise request + extraction ----
     try:
         out = denoise_request(
             pipe, prompt, neg, frames, size, steps, cfg_scale, generator, device, dtype,
-            want_latents=(not is_framepack)
+            want_latents=(not is_framepack),
+            sampling_type=sampling_type,
+            n_out_frames=(os.environ.get("FRAMEPACK_NUM_FRAMES") or None)
         )
         kind, payload = extract_latents_or_frames(out)
     except torch.cuda.OutOfMemoryError:
@@ -557,18 +537,21 @@ def run_one(
             frames2 = max(9, (frames if isinstance(frames, int) else 49) - 4)
             frames2 = round_wan_frames(frames2)
         steps2 = max(12, steps // 2)
-        print(f"[OOM@denoise] Retrying with size {size}->{size2}, frames {frames}->{frames2}, steps {steps}->{steps2}")
+        print(f"[OOM@denoise] Retrying with size {size}->{size2}, steps {steps}->{steps2}")
         out = denoise_request(
             pipe, prompt, neg, frames2, size2, steps2, cfg_scale, generator, device, dtype,
-            want_latents=(not is_framepack)
+            want_latents=(not is_framepack),
+            sampling_type=sampling_type,
+            n_out_frames=(os.environ.get("FRAMEPACK_NUM_FRAMES") or None)
         )
         kind, payload = extract_latents_or_frames(out)
-        size, frames, steps = size2, frames2, steps2
     except Exception as e:
         print(f"[Warn] First request failed ({e}). Retrying with decoded frames path.")
         out = denoise_request(
             pipe, prompt, neg, frames, size, steps, cfg_scale, generator, device, dtype,
-            want_latents=False
+            want_latents=False,
+            sampling_type=sampling_type,
+            n_out_frames=(os.environ.get("FRAMEPACK_NUM_FRAMES") or None)
         )
         kind, payload = extract_latents_or_frames(out)
 
@@ -618,10 +601,14 @@ def load_pipeline(cfg, backend, dtype, device):
     ).to(device)
 
     # memory helpers
-    try: pipe.enable_model_cpu_offload()
-    except: pass
-    try: pipe.vae.enable_tiling()
-    except: pass
+    try:
+        pipe.enable_model_cpu_offload()
+    except Exception:
+        pass
+    try:
+        pipe.vae.enable_tiling()
+    except Exception:
+        pass
 
     return pipe, "framepack"
 
@@ -636,47 +623,36 @@ def main():
     ap.add_argument("--t2i_model", type=str, default="", help="Diffusers T2I model id for auto keyframes")
     args = ap.parse_args()
 
-    # 1) Load cfg FIRST, then read from it. Do not touch cfg before this.
+    # 1) Load cfg FIRST
     cfg = load_cfg(args.config)
 
-    # 2) Decide how FramePack will get keyframes
-    #    Expose to run_one via globals since you referenced globals() there.
-    if args.init_dir:
-        init_frames_source = "dir"
-    elif args.backend == "framepack":
-        init_frames_source = "t2i"
-    else:
-        init_frames_source = None
-
+    # Optional: allow YAML to set default T2I model for keyframe generation
     if not args.t2i_model:
-        # allow YAML override
         args.t2i_model = cfg.get("model", {}).get("framepack_t2i", "black-forest-labs/FLUX.1-dev")
 
-    globals()["init_frames_source"] = init_frames_source
-    globals()["args"] = args  # used inside run_one
-
-    # ---- device/dtype and sampler/dataset config (unchanged) ----
+    # ---- device/dtype and sampler/dataset config ----
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype  = pick_dtype(cfg)
 
     seed       = int(cfg.get("sampler", {}).get("seed", 42))
-    frames     = int(cfg["sampler"]["frames"])
+    frames     = int(cfg["sampler"]["frames"])        # desired output frames
     fps        = int(cfg["sampler"]["fps"])
     size       = int(cfg["sampler"]["size"])
     steps      = int(cfg["sampler"]["steps"])
     cfg_scale  = float(cfg["sampler"]["cfg_scale"])
     neg_prompt = cfg["sampler"].get("negative_prompt", None)
     t_chunk    = int(cfg.get("sampler", {}).get("vae_t_chunk", 3))
+    sampling_type = cfg["sampler"].get("sampling_type", None)
 
     classes   = cfg["dataset"]["classes"]
     per_class = int(cfg["dataset"]["per_class"])
-    sampling_type = cfg["sampler"].get("sampling_type", None)
 
-    # ---- load pipeline and generate (unchanged) ----
+    # ---- load pipeline based on backend ----
     backend = args.backend
     pipe, backend = load_pipeline(cfg, backend, dtype, device)
     enable_memory_savers(pipe)
 
+    # WAN only: frame rounding rule and optional LoRA
     if backend == "wan":
         new_frames = round_wan_frames(frames)
         if new_frames != frames:
@@ -684,6 +660,14 @@ def main():
             frames = new_frames
         lora_path = cfg["model"].get("lora_path", "")
         maybe_load_lora(pipe, lora_path)
+
+    # For FramePack, expose desired num_frames via env for denoise_request
+    if isinstance(pipe, HunyuanVideoFramepackPipeline):
+        os.environ["FRAMEPACK_NUM_FRAMES"] = str(frames)
+
+    # If user provided keyframe dir, expose via env for run_one
+    if args.init_dir:
+        os.environ["FRAMEPACK_INIT_DIR"] = args.init_dir
 
     out_root = Path(cfg["dataset"]["out_dir"]) / backend
     out_root.mkdir(parents=True, exist_ok=True)
@@ -697,11 +681,12 @@ def main():
 
         for i in tqdm(range(per_class), desc=f"{cls:>12}"):
             prompt = f"a person performing {cls}"
+
             frames_rgb = run_one(
                 pipe=pipe,
                 prompt=prompt,
                 neg=neg_prompt,
-                frames=frames,      # WAN: int; FramePack: our run_one builds real keyframes if needed
+                frames=frames,      # WAN: int; FramePack: run_one builds real keyframes if needed
                 size=size,
                 steps=steps,
                 cfg_scale=cfg_scale,
@@ -709,9 +694,17 @@ def main():
                 device=device,
                 dtype=dtype,
                 t_chunk=t_chunk,
+                sampling_type=sampling_type,
             )
             path = cdir / f"{cls}_{i:02d}.mp4"
-            imageio.mimwrite(path, [to_hwc_uint8(fr) for fr in frames_rgb], fps=fps, macro_block_size=1)
+
+            imageio.mimwrite(
+                path,
+                [to_hwc_uint8(fr) for fr in frames_rgb],
+                fps=fps,
+                macro_block_size=1,
+            )
+
             del frames_rgb
             gc.collect()
             if torch.cuda.is_available():
