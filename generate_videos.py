@@ -182,7 +182,7 @@ def extract_latents_or_frames(output):
 
     # 3) Raw numpy array directly
     if isinstance(output, _np.ndarray):
-        # Expect shape (T, H, W, C) or (B, T, H, W, C). We'll handle downstream.
+        # Expect shape (T, H, W, C) or (B, T, H, W, C)
         return "frames", output
 
     # 4) Tuple/list forms from return_dict=False
@@ -202,7 +202,7 @@ def extract_latents_or_frames(output):
     if isinstance(output, _torch.Tensor) and output.dim() == 5:
         return "latents", output
 
-    # Debug breadcrumb so we can see what shape hit us
+    # Debug breadcrumb
     try:
         print("[extract] Unrecognized output type:", type(output))
         print("[extract] dir(output):", dir(output))
@@ -228,21 +228,35 @@ def decode_in_time_chunks(vae, latents: torch.Tensor, t_chunk: int = 3):
     for t0 in range(0, T, t_chunk):
         t1 = min(T, t0 + t_chunk)
         slab = latents[:, :, t0:t1]                       # (1, C, t, H, W)
-        slab = slab / scale  # correct rescaling for WAN latents
+        slab = slab / scale                                # crucial: correct rescaling for WAN latents
 
-        decoded = vae.decode(slab, return_dict=False)[0]  # often returns in [-1, 1]
+        decoded = vae.decode(slab, return_dict=False)[0]   # often returns floats but range varies
 
+        # Debug the first slab’s raw range
+        if t0 == 0:
+            try:
+                _mn, _mx = float(decoded.min()), float(decoded.max())
+                print(f"[Decode] raw slab0 range: {_mn:.6f}..{_mx:.6f}")
+            except Exception:
+                pass
+
+        # Dynamic normalization: handle [-1,1], [0,1], or narrow ranges gracefully
         if isinstance(decoded, torch.Tensor):
-            img = (decoded.clamp(-1, 1) + 1.0) * 0.5
-            img = (img * 255.0).clamp(0, 255).to(torch.uint8).cpu().numpy()
+            mn, mx = float(decoded.min()), float(decoded.max())
+            if mx - mn < 1e-6:
+                img = torch.zeros_like(decoded)
+            else:
+                decoded = (decoded - mn) / (mx - mn)
+            img = (decoded * 255.0).clamp(0, 255).to(torch.uint8).cpu().numpy()
         else:
             import numpy as _np
             arr = _np.asarray(decoded)
-            if arr.dtype.kind == "f":
-                if arr.min() < 0.0:
-                    arr = (arr.clip(-1, 1) + 1.0) * 0.5
-                arr = (arr * 255.0)
-            img = _np.clip(arr, 0, 255).astype(_np.uint8, copy=False)
+            mn, mx = arr.min(), arr.max()
+            if mx - mn < 1e-6:
+                arr = _np.zeros_like(arr)
+            else:
+                arr = (arr - mn) / (mx - mn)
+            img = (_np.clip(arr, 0, 1) * 255.0).astype(_np.uint8, copy=False)
 
         # Expect img shape (1, t, H, W, C)
         if img.ndim == 5 and img.shape[1] == (t1 - t0):
@@ -466,32 +480,6 @@ def run_one(
             a = a * 255.0
         return np.clip(a, 0, 255).astype(np.uint8, copy=False)
 
-    def _load_keyframes_from_dir(init_dir, size_px):
-        from pathlib import Path
-        from PIL import Image
-        p = Path(init_dir)
-        exts = {".png", ".jpg", ".jpeg", ".webp"}
-        paths = sorted([q for q in p.iterdir() if q.suffix.lower() in exts])
-        if not paths:
-            return None
-        def _read(path):
-            im = Image.open(path).convert("RGB").resize((size_px, size_px))
-            return np.asarray(im)
-        first = _read(paths[0])
-        last  = _read(paths[-1]) if len(paths) > 1 else None
-        return [first] if last is None else [first, last]
-
-    def _generate_dummy_keyframes(size_px):
-        """Fallback: generate two synthetic keyframes if nothing else available."""
-        print("[FramePack] Using fallback synthetic keyframes.")
-        imgs = []
-        for i, color in enumerate([(180,180,180), (120,120,255)]):
-            im = Image.new("RGB", (size_px, size_px), color)
-            draw = ImageDraw.Draw(im)
-            draw.text((size_px//3, size_px//2), f"Frame {i}", fill=(255,255,255))
-            imgs.append(np.asarray(im))
-        return imgs
-
     # --- FRAMEPACK keyframes handling ---
     if is_framepack:
         init_dir = os.environ.get("FRAMEPACK_INIT_DIR", "").strip() or "/content/keyframes/walking"
@@ -501,9 +489,7 @@ def run_one(
                 raise ValueError(f"No valid keyframes found in {init_dir}. Expected frame0.png and frame1.png.")
         else:
             raise ValueError(f"FramePack init directory not found: {init_dir}")
-
         frames = [_to_uint8_hwc(k) for k in kfs]
-
 
     # --- Generate video ---
     out = denoise_request(
@@ -523,12 +509,12 @@ def run_one(
         if isinstance(arr, torch.Tensor):
             arr = arr.detach().cpu().numpy()
         arr = np.asarray(arr)
-        print(f"[Debug] Direct frame payload shape {arr.shape}, dtype={arr.dtype}, min={arr.min() if arr.size>0 else None}, max={arr.max() if arr.size>0 else None}")
+        print(f"[Debug] Direct frame payload shape {arr.shape}, dtype={arr.dtype}, "
+              f"min={(arr.min() if arr.size>0 else None)}, max={(arr.max() if arr.size>0 else None)}")
         if arr.max() <= 1.01:
             arr = (arr * 255.0)
         arr = np.clip(arr, 0, 255).astype(np.uint8)
         frames_rgb = [arr[t] for t in range(arr.shape[0])] if arr.ndim == 4 else [arr]
-
 
     torch.cuda.empty_cache()
     gc.collect()
