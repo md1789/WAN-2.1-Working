@@ -637,29 +637,36 @@ def main():
     ap.add_argument("--config", required=True)
     ap.add_argument("--backend", choices=["wan", "framepack"], default="wan")
     ap.add_argument("--init_dir", type=str, default="", help="Directory with keyframe images (first/last).")
-    ap.add_argument("--t2i_model", type=str, default="", help="Diffusers T2I model id for auto keyframes (e.g., black-forest-labs/FLUX.1-dev)")
-
+    ap.add_argument("--t2i_model", type=str, default="", help="Diffusers T2I model id for auto keyframes")
     args = ap.parse_args()
-        # Decide keyframe strategy for FramePack
-    init_frames_source = None  # None | "dir" | "t2i"
+
+    # 1) Load cfg FIRST, then read from it. Do not touch cfg before this.
+    cfg = load_cfg(args.config)
+
+    # 2) Decide how FramePack will get keyframes
+    #    Expose to run_one via globals since you referenced globals() there.
     if args.init_dir:
         init_frames_source = "dir"
     elif args.backend == "framepack":
-        # If user didn't provide keyframes, auto-generate with T2I
         init_frames_source = "t2i"
-        if not args.t2i_model:
-            # Allow YAML to specify, else Flux as default
-            args.t2i_model = cfg["model"].get("framepack_t2i", "black-forest-labs/FLUX.1-dev")
+    else:
+        init_frames_source = None
 
-    cfg    = load_cfg(args.config)
+    if not args.t2i_model:
+        # allow YAML override
+        args.t2i_model = cfg.get("model", {}).get("framepack_t2i", "black-forest-labs/FLUX.1-dev")
+
+    globals()["init_frames_source"] = init_frames_source
+    globals()["args"] = args  # used inside run_one
+
+    # ---- device/dtype and sampler/dataset config (unchanged) ----
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype  = pick_dtype(cfg)
 
-    # ---- sampler / dataset config ----
     seed       = int(cfg.get("sampler", {}).get("seed", 42))
-    frames     = int(cfg["sampler"]["frames"])          # WAN: count. FramePack: we synthesize if not provided separately.
+    frames     = int(cfg["sampler"]["frames"])
     fps        = int(cfg["sampler"]["fps"])
-    size       = int(cfg["sampler"]["size"])            # square side
+    size       = int(cfg["sampler"]["size"])
     steps      = int(cfg["sampler"]["steps"])
     cfg_scale  = float(cfg["sampler"]["cfg_scale"])
     neg_prompt = cfg["sampler"].get("negative_prompt", None)
@@ -668,23 +675,19 @@ def main():
     classes   = cfg["dataset"]["classes"]
     per_class = int(cfg["dataset"]["per_class"])
 
-    # ---- load pipeline based on backend ----
+    # ---- load pipeline and generate (unchanged) ----
     backend = args.backend
     pipe, backend = load_pipeline(cfg, backend, dtype, device)
     enable_memory_savers(pipe)
 
-    # WAN only: frame rounding rule and optional LoRA
     if backend == "wan":
         new_frames = round_wan_frames(frames)
         if new_frames != frames:
             print(f"[Note] Rounded frames {frames} → {new_frames} to satisfy WAN’s requirement.")
             frames = new_frames
-
-        # Optional WAN LoRA
         lora_path = cfg["model"].get("lora_path", "")
         maybe_load_lora(pipe, lora_path)
 
-    # Output root per-backend
     out_root = Path(cfg["dataset"]["out_dir"]) / backend
     out_root.mkdir(parents=True, exist_ok=True)
 
@@ -697,12 +700,11 @@ def main():
 
         for i in tqdm(range(per_class), desc=f"{cls:>12}"):
             prompt = f"a person performing {cls}"
-
             frames_rgb = run_one(
                 pipe=pipe,
                 prompt=prompt,
                 neg=neg_prompt,
-                frames=frames,          # WAN: int; FramePack: function synthesizes neutral frames if not provided
+                frames=frames,      # WAN: int; FramePack: our run_one builds real keyframes if needed
                 size=size,
                 steps=steps,
                 cfg_scale=cfg_scale,
@@ -712,15 +714,7 @@ def main():
                 t_chunk=t_chunk,
             )
             path = cdir / f"{cls}_{i:02d}.mp4"
-
-            # Avoid ffmpeg auto-resize warnings by setting macro_block_size=1
-            imageio.mimwrite(
-                path,
-                [to_hwc_uint8(fr) for fr in frames_rgb],
-                fps=fps,
-                macro_block_size=1,
-            )
-
+            imageio.mimwrite(path, [to_hwc_uint8(fr) for fr in frames_rgb], fps=fps, macro_block_size=1)
             del frames_rgb
             gc.collect()
             if torch.cuda.is_available():
