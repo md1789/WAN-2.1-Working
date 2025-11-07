@@ -392,7 +392,6 @@ def denoise_request(
     device,
     dtype,
     want_latents=False,
-    sampling_type=None,
     n_out_frames=None,  # desired output frames for FramePack
 ):
     h = w = size
@@ -405,8 +404,6 @@ def denoise_request(
         guidance_scale=cfg_scale,
         generator=generator,
     )
-    if sampling_type is not None:
-        kwargs["sampling_type"] = sampling_type
     if neg is not None:
         kwargs["negative_prompt"] = neg
 
@@ -595,7 +592,6 @@ def main():
     cfg_scale  = float(cfg["sampler"]["cfg_scale"])
     neg_prompt = cfg["sampler"].get("negative_prompt", None)
     t_chunk    = int(cfg.get("sampler", {}).get("vae_t_chunk", 3))
-    sampling_type = cfg["sampler"].get("sampling_type", None)
 
     classes   = cfg["dataset"]["classes"]
     per_class = int(cfg["dataset"]["per_class"])
@@ -647,7 +643,6 @@ def main():
                 device=device,
                 dtype=dtype,
                 t_chunk=t_chunk,
-                sampling_type=sampling_type,
             )
             path = cdir / f"{cls}_{i:02d}.mp4"
 
